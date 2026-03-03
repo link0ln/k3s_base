@@ -1,0 +1,8 @@
+# Private SSH key — must not be committed
+artifacts/id_ed25519
+
+# kubeconfig contains cluster credentials and CA
+artifacts/kubeconfig
+
+# Ansible retry files
+*.retry

@@ -1,0 +1,547 @@
+---
+- name: Bootstrap k3s server with Cilium and NVIDIA GPU support
+  hosts: k3s
+  gather_facts: true
+
+  handlers:
+    - name: Restart sshd
+      service:
+        name: sshd
+        state: restarted
+
+    - name: Restart k3s
+      service:
+        name: k3s
+        state: restarted
+
+  pre_tasks:
+    # ── SSH key generation (local) ──────────────────────────────
+    - name: Ensure local artifacts directory exists
+      file:
+        path: "{{ playbook_dir }}/artifacts"
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+      become: false
+
+    - name: Generate ed25519 SSH keypair
+      command: >
+        ssh-keygen -t ed25519 -N ""
+        -C "ansible-k3s-{{ inventory_hostname }}"
+        -f "{{ playbook_dir }}/artifacts/id_ed25519"
+      args:
+        creates: "{{ playbook_dir }}/artifacts/id_ed25519"
+      delegate_to: localhost
+      become: false
+
+    # ── Ensure root SSH login is permitted ──────────────────────
+    - name: Ensure PermitRootLogin is yes in sshd_config
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PermitRootLogin'
+        line: 'PermitRootLogin yes'
+        state: present
+        backup: yes
+      notify: Restart sshd
+
+    - name: Flush handlers to apply sshd changes immediately
+      meta: flush_handlers
+
+  tasks:
+    # ── System packages ─────────────────────────────────────────
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install utility packages
+      apt:
+        name:
+          - net-tools
+          - mc
+          - dstat
+          - htop
+          - curl
+          - wget
+          - vim
+          - jq
+          - lsof
+          - iotop
+          - tcpdump
+          - unzip
+          - git
+          - apt-transport-https
+          - ca-certificates
+          - gnupg
+          - pciutils
+        state: present
+
+    # ── SSH key deployment ──────────────────────────────────────
+    - name: Deploy SSH public key to root authorized_keys
+      authorized_key:
+        user: root
+        state: present
+        key: "{{ lookup('file', playbook_dir + '/artifacts/id_ed25519.pub') }}"
+
+    # ── k3s config (BEFORE installation) ────────────────────────
+    - name: Ensure /etc/rancher/k3s directory exists
+      file:
+        path: /etc/rancher/k3s
+        state: directory
+        mode: '0755'
+
+    - name: Manage k3s config.yaml via blockinfile
+      blockinfile:
+        path: /etc/rancher/k3s/config.yaml
+        create: yes
+        mode: '0644'
+        marker: "# {mark} ANSIBLE MANAGED BLOCK"
+        block: "{{ lookup('template', 'templates/k3s-config.yaml.j2') }}"
+      notify: Restart k3s
+
+    # ── k3s installation ────────────────────────────────────────
+    # All k3s flags (flannel=none, disable-kube-proxy, etc.) are in config.yaml above
+    - name: Check if k3s is already installed
+      stat:
+        path: /usr/local/bin/k3s
+      register: k3s_binary
+
+    - name: Download k3s install script
+      get_url:
+        url: https://get.k3s.io
+        dest: /tmp/k3s-install.sh
+        mode: '0755'
+        timeout: 60
+      when: not k3s_binary.stat.exists
+
+    - name: Install k3s server
+      command: bash /tmp/k3s-install.sh
+      args:
+        creates: /usr/local/bin/k3s
+      environment:
+        INSTALL_K3S_EXEC: server
+
+    - name: Ensure k3s service is enabled and started
+      service:
+        name: k3s
+        state: started
+        enabled: yes
+
+    - name: Wait for k3s kubeconfig to appear
+      wait_for:
+        path: /etc/rancher/k3s/k3s.yaml
+        state: present
+        timeout: 120
+
+    - name: Wait for k3s API to become available
+      command: /usr/local/bin/k3s kubectl get nodes
+      register: k3s_ready
+      retries: 30
+      delay: 5
+      until: k3s_ready.rc == 0
+      changed_when: false
+
+    # ── Fetch kubeconfig ────────────────────────────────────────
+    - name: Read kubeconfig from remote
+      slurp:
+        src: /etc/rancher/k3s/k3s.yaml
+      register: kubeconfig_raw
+
+    - name: Write kubeconfig locally with corrected server address
+      copy:
+        content: "{{ kubeconfig_raw.content | b64decode | replace('127.0.0.1', ansible_host) | replace('localhost', ansible_host) }}"
+        dest: "{{ playbook_dir }}/artifacts/kubeconfig"
+        mode: '0600'
+      delegate_to: localhost
+      become: false
+
+    # ── Helm installation ───────────────────────────────────────
+    - name: Install Helm
+      shell: curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+      args:
+        creates: /usr/local/bin/helm
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+
+    # ── Cilium installation via Helm ────────────────────────────
+    - name: Add Cilium Helm repository
+      command: /usr/local/bin/helm repo add cilium https://helm.cilium.io/
+      register: helm_repo_add
+      changed_when: "'has been added' in helm_repo_add.stdout"
+      failed_when: helm_repo_add.rc != 0 and 'already exists' not in helm_repo_add.stderr
+      retries: 5
+      delay: 10
+      until: helm_repo_add.rc == 0 or 'already exists' in (helm_repo_add.stderr | default(''))
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+
+    - name: Update Helm repositories
+      command: /usr/local/bin/helm repo update
+      changed_when: false
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+
+    - name: Install or upgrade Cilium
+      command: >
+        /usr/local/bin/helm upgrade --install cilium cilium/cilium
+        --namespace kube-system
+        --set kubeProxyReplacement=true
+        --set k8sServiceHost={{ ansible_host }}
+        --set k8sServicePort=6443
+        --set operator.replicas=1
+      register: cilium_install
+      changed_when: "'has been upgraded' in cilium_install.stdout or 'has been installed' in cilium_install.stdout"
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+
+    - name: Wait for Cilium agent pods to be ready
+      command: >
+        /usr/local/bin/k3s kubectl wait
+        --for=condition=ready pod
+        -l app.kubernetes.io/name=cilium-agent
+        -n kube-system
+        --timeout=300s
+      changed_when: false
+
+    # ── Post-Cilium: restart system pods that started without CNI ──
+    - name: Rollout restart coredns
+      shell: /usr/local/bin/k3s kubectl rollout restart deployment coredns -n kube-system
+      changed_when: true
+
+    - name: Rollout restart metrics-server
+      shell: /usr/local/bin/k3s kubectl rollout restart deployment metrics-server -n kube-system
+      changed_when: true
+
+    - name: Rollout restart local-path-provisioner
+      shell: /usr/local/bin/k3s kubectl rollout restart deployment local-path-provisioner -n kube-system
+      changed_when: true
+
+    - name: Wait for coredns rollout
+      command: /usr/local/bin/k3s kubectl rollout status deployment coredns -n kube-system --timeout=120s
+      changed_when: false
+
+    - name: Wait for metrics-server rollout
+      command: /usr/local/bin/k3s kubectl rollout status deployment metrics-server -n kube-system --timeout=120s
+      changed_when: false
+
+    - name: Wait for local-path-provisioner rollout
+      command: /usr/local/bin/k3s kubectl rollout status deployment local-path-provisioner -n kube-system --timeout=120s
+      changed_when: false
+
+    # ── Configure local-path-provisioner storage path ──────────
+    - name: Ensure /k3s-storage directory exists on host
+      file:
+        path: /k3s-storage
+        state: directory
+        mode: '0755'
+
+    - name: Check current local-path-config storage path
+      shell: /usr/local/bin/k3s kubectl get configmap local-path-config -n kube-system -o jsonpath='{.data.config\.json}'
+      register: local_path_current_config
+      changed_when: false
+
+    - name: Patch local-path-config ConfigMap to use /k3s-storage
+      shell: |
+        /usr/local/bin/k3s kubectl get configmap local-path-config -n kube-system -o json \
+        | jq '.data["config.json"] = (.data["config.json"] | fromjson | .nodePathMap[0].paths = ["/k3s-storage"] | tojson)' \
+        | /usr/local/bin/k3s kubectl apply -f -
+      when: '"/k3s-storage" not in local_path_current_config.stdout'
+      register: local_path_patch
+
+    - name: Restart local-path-provisioner after config change
+      shell: /usr/local/bin/k3s kubectl rollout restart deployment local-path-provisioner -n kube-system
+      when: local_path_patch is changed
+
+    - name: Wait for local-path-provisioner after config change
+      command: /usr/local/bin/k3s kubectl rollout status deployment local-path-provisioner -n kube-system --timeout=120s
+      changed_when: false
+      when: local_path_patch is changed
+
+    # ── NVIDIA GPU support ──────────────────────────────────────
+    - name: Check if NVIDIA GPU is present
+      shell: lspci | grep -i nvidia
+      register: nvidia_check
+      changed_when: false
+      failed_when: false
+
+    - name: Set nvidia_gpu_present fact
+      set_fact:
+        nvidia_gpu_present: "{{ nvidia_check.rc == 0 }}"
+
+    # ── NVIDIA driver installation ──
+    - name: Check if NVIDIA driver is already loaded
+      shell: nvidia-smi
+      register: nvidia_smi_check
+      changed_when: false
+      failed_when: false
+      when: nvidia_gpu_present | bool
+
+    - name: Install NVIDIA driver (ubuntu-drivers)
+      block:
+        - name: Install ubuntu-drivers-common
+          apt:
+            name: ubuntu-drivers-common
+            state: present
+
+        - name: Detect recommended NVIDIA driver
+          command: ubuntu-drivers devices
+          register: ubuntu_drivers_output
+          changed_when: false
+
+        - name: Install recommended NVIDIA drivers
+          command: ubuntu-drivers autoinstall
+          register: nvidia_driver_install
+          changed_when: "'is already the newest version' not in nvidia_driver_install.stdout"
+      when:
+        - nvidia_gpu_present | bool
+        - nvidia_smi_check.rc != 0
+
+    # ── NVIDIA Container Toolkit ──
+    - name: Install NVIDIA container toolkit
+      block:
+        - name: Add NVIDIA container toolkit GPG key (modern approach)
+          shell: >
+            curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey
+            | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+          args:
+            creates: /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+
+        - name: Get OS distribution for NVIDIA repo
+          shell: '. /etc/os-release; echo $ID$VERSION_ID'
+          register: os_distribution
+          changed_when: false
+
+        - name: Download NVIDIA container toolkit repo list
+          get_url:
+            url: "https://nvidia.github.io/libnvidia-container/{{ os_distribution.stdout }}/libnvidia-container.list"
+            dest: /tmp/nvidia-container-toolkit.list
+            mode: '0644'
+            timeout: 30
+
+        - name: Add signed-by to NVIDIA repo list and install
+          shell: >
+            sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g'
+            /tmp/nvidia-container-toolkit.list
+            > /etc/apt/sources.list.d/nvidia-container-toolkit.list
+          args:
+            creates: /etc/apt/sources.list.d/nvidia-container-toolkit.list
+
+        - name: Update apt cache after adding NVIDIA repo
+          apt:
+            update_cache: yes
+
+        - name: Install nvidia-container-toolkit
+          apt:
+            name: nvidia-container-toolkit
+            state: present
+      when: nvidia_gpu_present | bool
+
+    # ── Configure containerd for NVIDIA runtime ──
+    - name: Ensure k3s containerd config directory exists
+      file:
+        path: /var/lib/rancher/k3s/agent/etc/containerd
+        state: directory
+        mode: '0755'
+      when: nvidia_gpu_present | bool
+
+    - name: Configure NVIDIA container runtime for k3s containerd
+      command: >
+        nvidia-ctk runtime configure
+        --runtime=containerd
+        --config=/var/lib/rancher/k3s/agent/etc/containerd/config.toml.tmpl
+        --set-as-default
+      args:
+        creates: /var/lib/rancher/k3s/agent/etc/containerd/config.toml.tmpl
+      when: nvidia_gpu_present | bool
+      notify: Restart k3s
+
+    - name: Flush handlers to restart k3s with NVIDIA runtime
+      meta: flush_handlers
+
+    - name: Wait for k3s API after NVIDIA runtime restart
+      command: /usr/local/bin/k3s kubectl get nodes
+      register: k3s_ready_nvidia
+      retries: 30
+      delay: 5
+      until: k3s_ready_nvidia.rc == 0
+      changed_when: false
+      when: nvidia_gpu_present | bool
+
+    # ── NVIDIA RuntimeClass for Kubernetes ──
+    - name: Create NVIDIA RuntimeClass manifest
+      copy:
+        content: |
+          apiVersion: node.k8s.io/v1
+          kind: RuntimeClass
+          metadata:
+            name: nvidia
+          handler: nvidia
+        dest: /var/lib/rancher/k3s/server/manifests/nvidia-runtime-class.yaml
+        mode: '0644'
+      when: nvidia_gpu_present | bool
+
+    # ── NVIDIA Device Plugin via Helm ──
+    - name: Add NVIDIA device plugin Helm repository
+      command: /usr/local/bin/helm repo add nvdp https://nvidia.github.io/k8s-device-plugin
+      register: nvdp_repo_add
+      changed_when: "'has been added' in nvdp_repo_add.stdout"
+      failed_when: nvdp_repo_add.rc != 0 and 'already exists' not in nvdp_repo_add.stderr
+      retries: 3
+      delay: 10
+      until: nvdp_repo_add.rc == 0 or 'already exists' in (nvdp_repo_add.stderr | default(''))
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      when: nvidia_gpu_present | bool
+
+    - name: Update Helm repositories (after NVIDIA repo)
+      command: /usr/local/bin/helm repo update
+      changed_when: false
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      when: nvidia_gpu_present | bool
+
+    - name: Install or upgrade NVIDIA device plugin
+      command: >
+        /usr/local/bin/helm upgrade --install nvidia-device-plugin nvdp/nvidia-device-plugin
+        --namespace kube-system
+        --set runtimeClassName=nvidia
+        --set deviceListStrategy=volume-mounts
+      register: nvdp_install
+      changed_when: "'has been upgraded' in nvdp_install.stdout or 'has been installed' in nvdp_install.stdout"
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      when: nvidia_gpu_present | bool
+
+    - name: Wait for NVIDIA device plugin to be ready
+      command: >
+        /usr/local/bin/k3s kubectl wait
+        --for=condition=ready pod
+        -l app.kubernetes.io/name=nvidia-device-plugin
+        -n kube-system
+        --timeout=300s
+      changed_when: false
+      when: nvidia_gpu_present | bool
+
+    # ── GPU verification ──
+    - name: Verify GPU is visible in Kubernetes
+      command: /usr/local/bin/k3s kubectl get nodes -o jsonpath='{.items[*].status.allocatable.nvidia\.com/gpu}'
+      register: gpu_allocatable
+      changed_when: false
+      when: nvidia_gpu_present | bool
+
+    - name: GPU support status
+      debug:
+        msg: >-
+          {{ 'NVIDIA GPU detected. Allocatable GPUs: ' + (gpu_allocatable.stdout | default('checking...'))
+             if (nvidia_gpu_present | bool)
+             else 'No NVIDIA GPU detected — GPU support tasks skipped' }}
+
+    # ══════════════════════════════════════════════════════════════
+    # ── Final post-checks: ensure all system pods are healthy ────
+    # ══════════════════════════════════════════════════════════════
+
+    # ── Cleanup stale pods ────────────────────────────────────────
+    - name: "Post-check: clean up Failed/Evicted pods in kube-system"
+      shell: >
+        /usr/local/bin/k3s kubectl delete pods -n kube-system
+        --field-selector=status.phase=Failed
+        --ignore-not-found=true
+      register: cleanup_failed
+      changed_when: "'deleted' in cleanup_failed.stdout"
+      failed_when: false
+
+    - name: "Post-check: clean up Pending cilium-operator pods (single-node)"
+      shell: >
+        /usr/local/bin/k3s kubectl delete pods -n kube-system
+        -l app.kubernetes.io/name=cilium-operator
+        --field-selector=status.phase=Pending
+        --ignore-not-found=true
+      register: cleanup_pending_operator
+      changed_when: "'deleted' in cleanup_pending_operator.stdout"
+      failed_when: false
+
+    # ── Node readiness ────────────────────────────────────────────
+    - name: "Post-check: wait for all nodes to be Ready"
+      command: >
+        /usr/local/bin/k3s kubectl wait
+        --for=condition=Ready node --all --timeout=120s
+      changed_when: false
+
+    # ── Deployment rollouts ───────────────────────────────────────
+    - name: "Post-check: wait for coredns deployment"
+      command: /usr/local/bin/k3s kubectl rollout status deployment/coredns -n kube-system --timeout=180s
+      changed_when: false
+
+    - name: "Post-check: wait for metrics-server deployment"
+      command: /usr/local/bin/k3s kubectl rollout status deployment/metrics-server -n kube-system --timeout=180s
+      changed_when: false
+
+    - name: "Post-check: wait for local-path-provisioner deployment"
+      command: /usr/local/bin/k3s kubectl rollout status deployment/local-path-provisioner -n kube-system --timeout=180s
+      changed_when: false
+
+    - name: "Post-check: wait for cilium-operator deployment"
+      command: /usr/local/bin/k3s kubectl rollout status deployment/cilium-operator -n kube-system --timeout=180s
+      changed_when: false
+
+    # ── DaemonSet rollouts ────────────────────────────────────────
+    - name: "Post-check: wait for cilium DaemonSet"
+      command: /usr/local/bin/k3s kubectl rollout status daemonset/cilium -n kube-system --timeout=180s
+      changed_when: false
+
+    - name: "Post-check: wait for nvidia-device-plugin pods"
+      command: >
+        /usr/local/bin/k3s kubectl wait
+        --for=condition=ready pod
+        -l app.kubernetes.io/name=nvidia-device-plugin
+        -n kube-system
+        --timeout=180s
+      changed_when: false
+      when: nvidia_gpu_present | default(false) | bool
+
+    # ── Comprehensive pod readiness verification ──────────────────
+    - name: "Post-check: verify all kube-system pods are Running with all containers Ready"
+      shell: |
+        set -e
+        ISSUES=""
+        while IFS= read -r line; do
+          [ -z "$line" ] && continue
+          NAME=$(echo "$line" | awk '{print $1}')
+          READY=$(echo "$line" | awk '{print $2}')
+          STATUS=$(echo "$line" | awk '{print $3}')
+          case "$STATUS" in Completed|Succeeded) continue;; esac
+          if [ "$STATUS" != "Running" ]; then
+            ISSUES="${ISSUES}  ${NAME} status=${STATUS}\n"
+            continue
+          fi
+          READY_COUNT=$(echo "$READY" | cut -d/ -f1)
+          TOTAL_COUNT=$(echo "$READY" | cut -d/ -f2)
+          if [ "$READY_COUNT" != "$TOTAL_COUNT" ]; then
+            ISSUES="${ISSUES}  ${NAME} containers not ready: ${READY}\n"
+          fi
+        done <<< "$(/usr/local/bin/k3s kubectl get pods -n kube-system --no-headers)"
+        if [ -n "$ISSUES" ]; then
+          printf "UNHEALTHY pods in kube-system:\n%b" "$ISSUES"
+          exit 1
+        fi
+        echo "All kube-system pods are Running with all containers Ready"
+      register: final_health
+      retries: 10
+      delay: 15
+      until: final_health.rc == 0
+      changed_when: false
+
+    # ── Final cluster state ───────────────────────────────────────
+    - name: "Post-check: display final cluster state"
+      shell: |
+        echo "=== Nodes ==="
+        /usr/local/bin/k3s kubectl get nodes -o wide
+        echo ""
+        echo "=== System Pods ==="
+        /usr/local/bin/k3s kubectl get pods -n kube-system -o wide
+      register: final_state
+      changed_when: false
+
+    - name: Cluster status
+      debug:
+        msg: "{{ final_state.stdout_lines }}"
