@@ -125,6 +125,22 @@
     msg: "ArgoCD Application '{{ argocd_app_name }}' deployed (repo: {{ argocd_app_repo }}, path: {{ argocd_app_path }})"
 
 # ── Generate kubeconfig for untrusted SA ──────────────────────────
+- name: Wait for ArgoCD to sync application
+  shell: |
+    for i in $(seq 1 30); do
+      STATUS=$(/usr/local/bin/k3s kubectl get application {{ argocd_app_name }} -n {{ argocd_namespace }} -o jsonpath='{.status.sync.status}' 2>/dev/null)
+      if [ "$STATUS" = "Synced" ]; then
+        echo "Synced"
+        exit 0
+      fi
+      sleep 5
+    done
+    echo "Timeout waiting for sync, current status: $STATUS"
+    exit 1
+  args:
+    executable: /bin/bash
+  changed_when: false
+
 - name: Wait for untrusted-user ServiceAccount
   command: /usr/local/bin/k3s kubectl get serviceaccount untrusted-user -n untrusted
   register: untrusted_sa_check
