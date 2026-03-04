@@ -124,6 +124,88 @@
   debug:
     msg: "ArgoCD Application '{{ argocd_app_name }}' deployed (repo: {{ argocd_app_repo }}, path: {{ argocd_app_path }})"
 
+# ── Generate kubeconfig for untrusted SA ──────────────────────────
+- name: Wait for untrusted-user ServiceAccount
+  command: /usr/local/bin/k3s kubectl get serviceaccount untrusted-user -n untrusted
+  register: untrusted_sa_check
+  retries: 12
+  delay: 10
+  until: untrusted_sa_check.rc == 0
+  changed_when: false
+
+- name: Create SA token secret for untrusted-user
+  command: /usr/local/bin/k3s kubectl apply -f -
+  args:
+    stdin: |
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: untrusted-user-token
+        namespace: untrusted
+        annotations:
+          kubernetes.io/service-account.name: untrusted-user
+      type: kubernetes.io/service-account-token
+  register: untrusted_secret_apply
+  changed_when: "'created' in untrusted_secret_apply.stdout or 'configured' in untrusted_secret_apply.stdout"
+
+- name: Wait for token to be populated in secret
+  shell: /usr/local/bin/k3s kubectl get secret untrusted-user-token -n untrusted -o jsonpath='{.data.token}'
+  register: untrusted_token_check
+  retries: 12
+  delay: 5
+  until: untrusted_token_check.stdout | length > 0
+  changed_when: false
+
+- name: Extract SA token and CA from secret
+  shell: |
+    TOKEN=$(/usr/local/bin/k3s kubectl get secret untrusted-user-token -n untrusted -o jsonpath='{.data.token}' | base64 -d)
+    CA=$(/usr/local/bin/k3s kubectl get secret untrusted-user-token -n untrusted -o jsonpath='{.data.ca\.crt}')
+    echo "${TOKEN}"
+    echo "---CA---"
+    echo "${CA}"
+  args:
+    executable: /bin/bash
+  register: untrusted_sa_data
+  changed_when: false
+  no_log: true
+
+- name: Set SA token and CA facts
+  set_fact:
+    untrusted_sa_token: "{{ untrusted_sa_data.stdout.split('---CA---')[0] | trim }}"
+    untrusted_sa_ca: "{{ untrusted_sa_data.stdout.split('---CA---')[1] | trim }}"
+  no_log: true
+
+- name: Generate kubeconfig for untrusted-user SA
+  copy:
+    content: |
+      apiVersion: v1
+      kind: Config
+      clusters:
+        - cluster:
+            certificate-authority-data: {{ untrusted_sa_ca }}
+            server: https://{{ hostvars[inventory_hostname]['ansible_host'] }}:6443
+          name: k3s
+      contexts:
+        - context:
+            cluster: k3s
+            namespace: untrusted
+            user: untrusted-user
+          name: untrusted
+      current-context: untrusted
+      users:
+        - name: untrusted-user
+          user:
+            token: {{ untrusted_sa_token }}
+    dest: "{{ playbook_dir }}/artifacts/untrusted-kubeconfig"
+    mode: '0600'
+  delegate_to: localhost
+  become: false
+  no_log: true
+
+- name: Untrusted kubeconfig status
+  debug:
+    msg: "Kubeconfig for untrusted-user SA saved to: artifacts/untrusted-kubeconfig"
+
 # ── Status output ─────────────────────────────────────────────────
 - name: Display ArgoCD pod status
   shell: /usr/local/bin/k3s kubectl get pods -n {{ argocd_namespace }} -o wide

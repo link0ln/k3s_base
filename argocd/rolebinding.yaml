@@ -1,0 +1,13 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: untrusted-user-binding
+  namespace: untrusted
+subjects:
+  - kind: ServiceAccount
+    name: untrusted-user
+    namespace: untrusted
+roleRef:
+  kind: Role
+  name: untrusted-user-role
+  apiGroup: rbac.authorization.k8s.io

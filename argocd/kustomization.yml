@@ -6,3 +6,6 @@ resources:
   - resource-quota.yaml
   - limit-range.yaml
   - appproject.yaml
+  - serviceaccount.yaml
+  - role.yaml
+  - rolebinding.yaml
