@@ -1,0 +1,19 @@
+---
+cilium_helm_repo_url: https://helm.cilium.io/
+cilium_kube_proxy_replacement: true
+cilium_operator_replicas: 1
+cilium_bpf_enable_tcx: false
+cilium_bpf_masquerade: true
+cilium_bpf_host_legacy_routing: true
+cilium_routing_mode: native
+cilium_native_routing_cidr: 10.0.0.0/24
+cilium_auto_direct_node_routes: true
+cilium_socket_lb_host_ns_only: true
+cilium_wait_timeout: 300s
+cilium_helm_retries: 5
+cilium_helm_delay: 10
+cilium_bpf_recovery_api_retries: 30
+cilium_bpf_recovery_api_delay: 5
+cilium_bpf_recovery_cilium_retries: 6
+cilium_bpf_recovery_cilium_delay: 10
+cilium_rollout_timeout: 120s

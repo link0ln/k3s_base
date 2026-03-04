@@ -1,0 +1,17 @@
+---
+nvidia_cuda_keyring_url: https://developer.download.nvidia.com/compute/cuda/repos/wsl-ubuntu/x86_64/cuda-keyring_1.1-1_all.deb
+nvidia_container_toolkit_gpg_url: https://nvidia.github.io/libnvidia-container/gpgkey
+nvidia_container_toolkit_list_url: https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list
+nvidia_device_plugin_repo_name: nvdp
+nvidia_device_plugin_repo_url: https://nvidia.github.io/k8s-device-plugin
+nvidia_runtime_class_name: nvidia
+nvidia_device_list_strategy: volume-mounts
+nvidia_device_plugin_helm_retries: 3
+nvidia_device_plugin_helm_delay: 10
+nvidia_api_retries: 30
+nvidia_api_delay: 5
+nvidia_cilium_wait_timeout: 300s
+nvidia_cilium_wait_retries: 6
+nvidia_cilium_wait_delay: 10
+nvidia_rollout_timeout: 120s
+nvidia_device_plugin_wait_timeout: 300s

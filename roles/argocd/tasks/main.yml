@@ -1,0 +1,145 @@
+---
+# ── ArgoCD installation via Helm ──────────────────────────────────
+
+# ── Password generation (local, idempotent) ───────────────────────
+- name: Check if ArgoCD admin password file exists
+  stat:
+    path: "{{ argocd_password_file }}"
+  delegate_to: localhost
+  become: false
+  register: argocd_password_stat
+
+- name: Generate ArgoCD admin password and bcrypt hash
+  shell: python3 -c "import secrets,string,bcrypt;pw=''.join(secrets.choice(string.ascii_letters+string.digits)for _ in range({{ argocd_password_length }}));h=bcrypt.hashpw(pw.encode(),bcrypt.gensalt()).decode();print(pw+chr(10)+h)"
+  delegate_to: localhost
+  become: false
+  register: argocd_password_gen
+  no_log: true
+  when: not argocd_password_stat.stat.exists
+
+- name: Save ArgoCD admin password to file
+  copy:
+    content: "{{ argocd_password_gen.stdout_lines[0] }}"
+    dest: "{{ argocd_password_file }}"
+    mode: '0600'
+  delegate_to: localhost
+  become: false
+  no_log: true
+  when: not argocd_password_stat.stat.exists
+
+- name: Set ArgoCD password hash fact (new password)
+  set_fact:
+    argocd_bcrypt_hash: "{{ argocd_password_gen.stdout_lines[1] }}"
+  no_log: true
+  when: not argocd_password_stat.stat.exists
+
+- name: Regenerate bcrypt hash from existing password file
+  shell: python3 -c "import bcrypt;pw=open('{{ argocd_password_file }}').read().strip();h=bcrypt.hashpw(pw.encode(),bcrypt.gensalt()).decode();print(h)"
+  delegate_to: localhost
+  become: false
+  register: argocd_existing_hash
+  no_log: true
+  when: argocd_password_stat.stat.exists
+
+- name: Set ArgoCD password hash fact (existing password)
+  set_fact:
+    argocd_bcrypt_hash: "{{ argocd_existing_hash.stdout }}"
+  no_log: true
+  when: argocd_password_stat.stat.exists
+
+# ── Namespace ─────────────────────────────────────────────────────
+- name: Create ArgoCD namespace
+  command: /usr/local/bin/k3s kubectl create namespace {{ argocd_namespace }}
+  register: argocd_ns
+  changed_when: argocd_ns.rc == 0
+  failed_when: argocd_ns.rc != 0 and 'already exists' not in argocd_ns.stderr
+
+# ── Helm install ──────────────────────────────────────────────────
+- name: Add ArgoCD Helm repository
+  command: /usr/local/bin/helm repo add {{ argocd_helm_repo_name }} {{ argocd_helm_repo_url }}
+  register: argocd_repo_add
+  changed_when: "'has been added' in argocd_repo_add.stdout"
+  failed_when: argocd_repo_add.rc != 0 and 'already exists' not in argocd_repo_add.stderr
+  retries: 5
+  delay: 10
+  until: argocd_repo_add.rc == 0 or 'already exists' in (argocd_repo_add.stderr | default(''))
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+
+- name: Update Helm repositories
+  command: /usr/local/bin/helm repo update
+  changed_when: false
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+
+- name: Install or upgrade ArgoCD
+  command: >
+    /usr/local/bin/helm upgrade --install {{ argocd_release_name }} {{ argocd_helm_repo_name }}/{{ argocd_chart_name }}
+    --namespace {{ argocd_namespace }}
+    --set-string configs.secret.argocdServerAdminPassword={{ argocd_bcrypt_hash }}
+    --set redis.image.repository=redis
+    --set redis.image.tag=7-alpine
+    --wait
+    --timeout {{ argocd_helm_timeout }}
+  register: argocd_install
+  changed_when: "'has been upgraded' in argocd_install.stdout or 'has been installed' in argocd_install.stdout"
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+
+# ── Wait for readiness ────────────────────────────────────────────
+- name: Wait for argocd-server deployment rollout
+  command: >
+    /usr/local/bin/k3s kubectl rollout status
+    deployment/argocd-server
+    -n {{ argocd_namespace }}
+    --timeout={{ argocd_wait_timeout }}
+  changed_when: false
+
+- name: Wait for ArgoCD pods to be ready
+  shell: >
+    /usr/local/bin/k3s kubectl get pods -n {{ argocd_namespace }}
+    -l app.kubernetes.io/instance={{ argocd_release_name }}
+    --field-selector=status.phase=Running
+    -o jsonpath='{.items[*].metadata.name}' |
+    tr ' ' '\n' | grep -v '^$' |
+    xargs -r /usr/local/bin/k3s kubectl wait
+    --for=condition=ready pod
+    -n {{ argocd_namespace }}
+    --timeout={{ argocd_wait_timeout }}
+  changed_when: false
+  register: argocd_wait
+  retries: 3
+  delay: 10
+  until: argocd_wait.rc == 0
+
+# ── Deploy ArgoCD Application ─────────────────────────────────────
+- name: Deploy ArgoCD Application for k3s-base
+  shell: >
+    /usr/local/bin/k3s kubectl apply -f -
+    <<'EOF'
+    {{ lookup('template', 'argocd-application.yml.j2') }}
+    EOF
+  args:
+    executable: /bin/bash
+  register: argocd_app_apply
+  changed_when: "'created' in argocd_app_apply.stdout or 'configured' in argocd_app_apply.stdout"
+
+- name: ArgoCD Application status
+  debug:
+    msg: "ArgoCD Application '{{ argocd_app_name }}' deployed (repo: {{ argocd_app_repo }}, path: {{ argocd_app_path }})"
+
+# ── Status output ─────────────────────────────────────────────────
+- name: Display ArgoCD pod status
+  shell: /usr/local/bin/k3s kubectl get pods -n {{ argocd_namespace }} -o wide
+  register: argocd_pods
+  changed_when: false
+
+- name: ArgoCD deployment summary
+  debug:
+    msg:
+      - "ArgoCD deployed successfully in namespace '{{ argocd_namespace }}'"
+      - "Admin password saved to: {{ argocd_password_file }}"
+      - "Access UI: kubectl port-forward svc/argocd-server -n {{ argocd_namespace }} 8080:443"
+      - "Login: admin / <contents of {{ argocd_password_file }}>"
+      - ""
+      - "{{ argocd_pods.stdout_lines }}"

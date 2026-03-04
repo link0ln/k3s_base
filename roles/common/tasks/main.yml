@@ -1,0 +1,54 @@
+---
+# ── System packages ─────────────────────────────────────────
+- name: Update apt cache
+  apt:
+    update_cache: yes
+    cache_valid_time: 3600
+
+- name: Install utility packages
+  apt:
+    name: "{{ common_packages }}"
+    state: present
+
+# ── SSH key deployment ──────────────────────────────────────
+- name: Deploy SSH public key to root authorized_keys
+  authorized_key:
+    user: root
+    state: present
+    key: "{{ lookup('file', playbook_dir + '/artifacts/id_ed25519.pub') }}"
+
+# ── Detect WSL environment early (needed for kernel tuning) ──
+- name: Detect if running under WSL (early)
+  shell: grep -qi microsoft /proc/version
+  register: wsl_check
+  changed_when: false
+  failed_when: false
+
+- name: Set is_wsl fact (early)
+  set_fact:
+    is_wsl: "{{ wsl_check.rc == 0 }}"
+
+# ── Kernel tuning for Cilium (WSL2 workaround) ──────────────
+- name: Set default rp_filter to 0 for new interfaces
+  sysctl:
+    name: net.ipv4.conf.default.rp_filter
+    value: '0'
+    sysctl_set: yes
+    reload: yes
+  when: is_wsl | default(false) | bool
+
+- name: Deploy cilium-rp-filter-fix systemd service
+  copy:
+    src: cilium-rp-filter-fix.service
+    dest: /etc/systemd/system/cilium-rp-filter-fix.service
+    mode: '0644'
+  when: is_wsl | default(false) | bool
+  register: rp_filter_service
+
+- name: Enable and start cilium-rp-filter-fix service
+  systemd:
+    name: cilium-rp-filter-fix
+    enabled: yes
+    state: started
+    daemon_reload: "{{ rp_filter_service is changed }}"
+  when: is_wsl | default(false) | bool

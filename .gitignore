@@ -4,5 +4,8 @@ artifacts/id_ed25519
 # kubeconfig contains cluster credentials and CA
 artifacts/kubeconfig
 
+# ArgoCD admin password
+artifacts/argocd-admin-password
+
 # Ansible retry files
 *.retry

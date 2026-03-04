@@ -1,0 +1,486 @@
+---
+# Security tests for the 'untrusted' namespace isolation
+# Validates: CiliumNetworkPolicy, PSA baseline, ResourceQuota, LimitRange, ingress deny
+#
+# Usage:
+#   export KUBECONFIG=/opt/gitrepo/k3s_base/artifacts/kubeconfig
+#   ansible-playbook tests/test-untrusted-security.yml -v
+
+- name: Test untrusted namespace security controls
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    ns: untrusted
+    test_pod: test-netcheck
+    test_results: []
+
+  tasks:
+    # ------------------------------------------------------------------
+    # Setup: create a busybox pod for network tests
+    # ------------------------------------------------------------------
+    - name: "Setup: create network test pod"
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: "{{ test_pod }}"
+            namespace: "{{ ns }}"
+          spec:
+            containers:
+              - name: net
+                image: busybox:1.36
+                command: ["sleep", "300"]
+                resources:
+                  requests:
+                    cpu: 50m
+                    memory: 64Mi
+                  limits:
+                    cpu: 200m
+                    memory: 256Mi
+            terminationGracePeriodSeconds: 0
+
+    - name: "Setup: wait for test pod to be ready"
+      command: >
+        kubectl wait pod/{{ test_pod }} -n {{ ns }}
+        --for=condition=Ready --timeout=60s
+      changed_when: false
+
+    # ==================================================================
+    # 1. Network isolation (CiliumNetworkPolicy)
+    # ==================================================================
+
+    # --- 1a. Private range blocked (192.168.1.1) ---
+    - name: "NET-01: egress to 192.168.0.0/16 must be blocked"
+      command: >
+        kubectl exec {{ test_pod }} -n {{ ns }} --
+        wget -q -O /dev/null --timeout=3 http://192.168.1.1
+      register: net01
+      failed_when: false
+      changed_when: false
+
+    - name: "NET-01: record result"
+      set_fact:
+        test_results: >-
+          {{ test_results + [{ 'name': 'NET-01 egress private 192.168.x blocked',
+          'pass': (net01.rc != 0) }] }}
+
+    # --- 1b. Private range blocked (10.x) ---
+    - name: "NET-02: egress to 10.0.0.0/8 must be blocked"
+      command: >
+        kubectl exec {{ test_pod }} -n {{ ns }} --
+        wget -q -O /dev/null --timeout=3 http://10.200.240.1
+      register: net02
+      failed_when: false
+      changed_when: false
+
+    - name: "NET-02: record result"
+      set_fact:
+        test_results: >-
+          {{ test_results + [{ 'name': 'NET-02 egress private 10.x blocked',
+          'pass': (net02.rc != 0) }] }}
+
+    # --- 1c. DNS resolution allowed ---
+    - name: "NET-03: DNS resolution must work"
+      command: >
+        kubectl exec {{ test_pod }} -n {{ ns }} --
+        nslookup google.com
+      register: net03
+      failed_when: false
+      changed_when: false
+
+    - name: "NET-03: record result"
+      set_fact:
+        test_results: >-
+          {{ test_results + [{ 'name': 'NET-03 DNS resolution allowed',
+          'pass': (net03.rc == 0) }] }}
+
+    # --- 1d. Public internet allowed ---
+    - name: "NET-04: public egress must work"
+      command: >
+        kubectl exec {{ test_pod }} -n {{ ns }} --
+        wget -q -O /dev/null --timeout=10 https://httpbin.org/ip
+      register: net04
+      failed_when: false
+      changed_when: false
+
+    - name: "NET-04: record result"
+      set_fact:
+        test_results: >-
+          {{ test_results + [{ 'name': 'NET-04 public egress allowed',
+          'pass': (net04.rc == 0) }] }}
+
+    # ==================================================================
+    # 2. PSA baseline — host isolation
+    # ==================================================================
+
+    # --- 2a. hostPath volume blocked ---
+    - name: "PSA-01: pod with hostPath must be rejected"
+      command: >
+        kubectl apply -n {{ ns }} -f - --dry-run=server
+      args:
+        stdin: |
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: test-psa-hostpath
+          spec:
+            containers:
+              - name: t
+                image: busybox:1.36
+                command: ["true"]
+                volumeMounts:
+                  - name: hostdir
+                    mountPath: /hostdir
+            volumes:
+              - name: hostdir
+                hostPath:
+                  path: /etc
+      register: psa01
+      failed_when: false
+      changed_when: false
+
+    - name: "PSA-01: record result"
+      set_fact:
+        test_results: >-
+          {{ test_results + [{ 'name': 'PSA-01 hostPath blocked',
+          'pass': (psa01.rc != 0) }] }}
+
+    # --- 2b. hostNetwork blocked ---
+    - name: "PSA-02: pod with hostNetwork must be rejected"
+      command: >
+        kubectl apply -n {{ ns }} -f - --dry-run=server
+      args:
+        stdin: |
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: test-psa-hostnet
+          spec:
+            hostNetwork: true
+            containers:
+              - name: t
+                image: busybox:1.36
+                command: ["true"]
+      register: psa02
+      failed_when: false
+      changed_when: false
+
+    - name: "PSA-02: record result"
+      set_fact:
+        test_results: >-
+          {{ test_results + [{ 'name': 'PSA-02 hostNetwork blocked',
+          'pass': (psa02.rc != 0) }] }}
+
+    # --- 2c. hostPID blocked ---
+    - name: "PSA-03: pod with hostPID must be rejected"
+      command: >
+        kubectl apply -n {{ ns }} -f - --dry-run=server
+      args:
+        stdin: |
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: test-psa-hostpid
+          spec:
+            hostPID: true
+            containers:
+              - name: t
+                image: busybox:1.36
+                command: ["true"]
+      register: psa03
+      failed_when: false
+      changed_when: false
+
+    - name: "PSA-03: record result"
+      set_fact:
+        test_results: >-
+          {{ test_results + [{ 'name': 'PSA-03 hostPID blocked',
+          'pass': (psa03.rc != 0) }] }}
+
+    # --- 2d. privileged container blocked ---
+    - name: "PSA-04: privileged container must be rejected"
+      command: >
+        kubectl apply -n {{ ns }} -f - --dry-run=server
+      args:
+        stdin: |
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: test-psa-privileged
+          spec:
+            containers:
+              - name: t
+                image: busybox:1.36
+                command: ["true"]
+                securityContext:
+                  privileged: true
+      register: psa04
+      failed_when: false
+      changed_when: false
+
+    - name: "PSA-04: record result"
+      set_fact:
+        test_results: >-
+          {{ test_results + [{ 'name': 'PSA-04 privileged blocked',
+          'pass': (psa04.rc != 0) }] }}
+
+    # ==================================================================
+    # 3. GPU access
+    # ==================================================================
+
+    - name: "GPU-01: check if GPU resources available on nodes"
+      command: >
+        kubectl get nodes -o jsonpath='{.items[*].status.allocatable.nvidia\.com/gpu}'
+      register: gpu_check
+      changed_when: false
+
+    - name: "GPU-01: test GPU pod scheduling"
+      when: gpu_check.stdout | default('') | regex_search('[1-9]')
+      block:
+        - name: "GPU-01: create pod requesting GPU"
+          command: >
+            kubectl apply -n {{ ns }} -f -
+          args:
+            stdin: |
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                name: test-gpu
+              spec:
+                runtimeClassName: nvidia
+                containers:
+                  - name: gpu
+                    image: busybox:1.36
+                    command: ["sleep", "10"]
+                    resources:
+                      requests:
+                        nvidia.com/gpu: "1"
+                      limits:
+                        nvidia.com/gpu: "1"
+                        cpu: 200m
+                        memory: 256Mi
+                terminationGracePeriodSeconds: 0
+          register: gpu01_apply
+          failed_when: false
+          changed_when: false
+
+        - name: "GPU-01: wait for GPU pod"
+          command: >
+            kubectl wait pod/test-gpu -n {{ ns }}
+            --for=condition=Ready --timeout=120s
+          register: gpu01_wait
+          failed_when: false
+          changed_when: false
+          when: gpu01_apply.rc == 0
+
+        - name: "GPU-01: record result"
+          set_fact:
+            test_results: >-
+              {{ test_results + [{ 'name': 'GPU-01 GPU pod scheduled',
+              'pass': (gpu01_apply.rc == 0 and (gpu01_wait.rc | default(1)) == 0) }] }}
+
+        - name: "GPU-01: cleanup"
+          command: kubectl delete pod test-gpu -n {{ ns }} --ignore-not-found --grace-period=0 --force
+          failed_when: false
+          changed_when: false
+
+    - name: "GPU-01: skip — no GPU on nodes"
+      when: not (gpu_check.stdout | default('') | regex_search('[1-9]'))
+      set_fact:
+        test_results: >-
+          {{ test_results + [{ 'name': 'GPU-01 GPU pod scheduled',
+          'pass': 'SKIP' }] }}
+
+    # ==================================================================
+    # 4. Resource limits (ResourceQuota / LimitRange)
+    # ==================================================================
+
+    # --- 4a. NodePort service blocked ---
+    - name: "QUOTA-01: NodePort service must be blocked"
+      command: >
+        kubectl apply -n {{ ns }} -f - --dry-run=server
+      args:
+        stdin: |
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: test-nodeport
+          spec:
+            type: NodePort
+            ports:
+              - port: 80
+                targetPort: 80
+            selector:
+              app: test
+      register: quota01
+      failed_when: false
+      changed_when: false
+
+    - name: "QUOTA-01: record result"
+      set_fact:
+        test_results: >-
+          {{ test_results + [{ 'name': 'QUOTA-01 NodePort blocked by quota',
+          'pass': (quota01.rc != 0) }] }}
+
+    # --- 4b. Excessive CPU blocked by quota ---
+    - name: "QUOTA-02: pod exceeding CPU quota must be rejected"
+      command: >
+        kubectl apply -n {{ ns }} -f - --dry-run=server
+      args:
+        stdin: |
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: test-overcpu
+          spec:
+            containers:
+              - name: t
+                image: busybox:1.36
+                command: ["true"]
+                resources:
+                  requests:
+                    cpu: "3"
+                    memory: 64Mi
+                  limits:
+                    cpu: "3"
+                    memory: 256Mi
+      register: quota02
+      failed_when: false
+      changed_when: false
+
+    - name: "QUOTA-02: record result"
+      set_fact:
+        test_results: >-
+          {{ test_results + [{ 'name': 'QUOTA-02 CPU > quota blocked',
+          'pass': (quota02.rc != 0) }] }}
+
+    # --- 4c. Memory exceeding LimitRange max ---
+    - name: "LIMIT-01: container exceeding LimitRange memory max must be rejected"
+      command: >
+        kubectl apply -n {{ ns }} -f - --dry-run=server
+      args:
+        stdin: |
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: test-overmem
+          spec:
+            containers:
+              - name: t
+                image: busybox:1.36
+                command: ["true"]
+                resources:
+                  requests:
+                    cpu: 50m
+                    memory: 64Mi
+                  limits:
+                    cpu: 200m
+                    memory: 4Gi
+      register: limit01
+      failed_when: false
+      changed_when: false
+
+    - name: "LIMIT-01: record result"
+      set_fact:
+        test_results: >-
+          {{ test_results + [{ 'name': 'LIMIT-01 memory > LimitRange blocked',
+          'pass': (limit01.rc != 0) }] }}
+
+    # ==================================================================
+    # 5. Ingress isolation — cross-namespace access denied
+    # ==================================================================
+
+    - name: "INGRESS-01: cross-namespace access must be denied"
+      block:
+        - name: "INGRESS-01: get test pod IP"
+          command: >
+            kubectl get pod {{ test_pod }} -n {{ ns }}
+            -o jsonpath='{.status.podIP}'
+          register: pod_ip
+          changed_when: false
+
+        - name: "INGRESS-01: start listener in test pod"
+          command: >
+            kubectl exec {{ test_pod }} -n {{ ns }} --
+            sh -c 'nc -l -p 8080 &'
+          failed_when: false
+          changed_when: false
+
+        - name: "INGRESS-01: create probe pod in default namespace"
+          kubernetes.core.k8s:
+            state: present
+            definition:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                name: test-ingress-probe
+                namespace: default
+              spec:
+                containers:
+                  - name: probe
+                    image: busybox:1.36
+                    command: ["sleep", "60"]
+                terminationGracePeriodSeconds: 0
+
+        - name: "INGRESS-01: wait for probe pod"
+          command: >
+            kubectl wait pod/test-ingress-probe -n default
+            --for=condition=Ready --timeout=60s
+          changed_when: false
+
+        - name: "INGRESS-01: attempt cross-namespace connection"
+          command: >
+            kubectl exec test-ingress-probe -n default --
+            sh -c 'wget -q -O /dev/null --timeout=3 http://{{ pod_ip.stdout }}:8080 || exit 1'
+          register: ingress01
+          failed_when: false
+          changed_when: false
+
+        - name: "INGRESS-01: record result"
+          set_fact:
+            test_results: >-
+              {{ test_results + [{ 'name': 'INGRESS-01 cross-ns ingress denied',
+              'pass': (ingress01.rc != 0) }] }}
+
+      always:
+        - name: "INGRESS-01: cleanup probe pod"
+          command: kubectl delete pod test-ingress-probe -n default --ignore-not-found --grace-period=0 --force
+          failed_when: false
+          changed_when: false
+
+    # ==================================================================
+    # Cleanup & Summary
+    # ==================================================================
+
+    - name: "Cleanup: delete network test pod"
+      command: kubectl delete pod {{ test_pod }} -n {{ ns }} --ignore-not-found --grace-period=0 --force
+      failed_when: false
+      changed_when: false
+
+    - name: "Summary: display test results"
+      vars:
+        passed: "{{ test_results | selectattr('pass', 'equalto', true) | list }}"
+        failed: "{{ test_results | selectattr('pass', 'equalto', false) | list }}"
+        skipped: "{{ test_results | selectattr('pass', 'equalto', 'SKIP') | list }}"
+      debug:
+        msg: |
+          ═══════════════════════════════════════════════════════
+            UNTRUSTED NAMESPACE SECURITY TEST RESULTS
+          ═══════════════════════════════════════════════════════
+          {% for t in test_results %}
+          {{ '  ✅ PASS' if t.pass == true else ('  ⏭️  SKIP' if t.pass == 'SKIP' else '  ❌ FAIL') }}  {{ t.name }}
+          {% endfor %}
+          ───────────────────────────────────────────────────────
+            Total: {{ test_results | length }}  |  Passed: {{ passed | length }}  |  Failed: {{ failed | length }}  |  Skipped: {{ skipped | length }}
+          ═══════════════════════════════════════════════════════
+
+    - name: "Gate: fail playbook if any test failed"
+      vars:
+        failed: "{{ test_results | selectattr('pass', 'equalto', false) | list }}"
+      fail:
+        msg: "{{ failed | length }} test(s) FAILED — see summary above"
+      when: failed | length > 0

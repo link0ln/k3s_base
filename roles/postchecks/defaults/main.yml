@@ -1,0 +1,5 @@
+---
+postchecks_pod_health_retries: 10
+postchecks_pod_health_delay: 15
+postchecks_rollout_timeout: 180s
+postchecks_node_timeout: 120s

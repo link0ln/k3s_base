@@ -1,0 +1,113 @@
+---
+# ══════════════════════════════════════════════════════════════
+# ── Final post-checks: ensure all system pods are healthy ────
+# ══════════════════════════════════════════════════════════════
+
+# ── Cleanup stale pods ────────────────────────────────────────
+- name: "Post-check: clean up Failed/Evicted pods in kube-system"
+  shell: >
+    /usr/local/bin/k3s kubectl delete pods -n kube-system
+    --field-selector=status.phase=Failed
+    --ignore-not-found=true
+  register: cleanup_failed
+  changed_when: "'deleted' in cleanup_failed.stdout"
+  failed_when: false
+
+- name: "Post-check: clean up Pending cilium-operator pods (single-node)"
+  shell: >
+    /usr/local/bin/k3s kubectl delete pods -n kube-system
+    -l app.kubernetes.io/name=cilium-operator
+    --field-selector=status.phase=Pending
+    --ignore-not-found=true
+  register: cleanup_pending_operator
+  changed_when: "'deleted' in cleanup_pending_operator.stdout"
+  failed_when: false
+
+# ── Node readiness ────────────────────────────────────────────
+- name: "Post-check: wait for all nodes to be Ready"
+  command: >
+    /usr/local/bin/k3s kubectl wait
+    --for=condition=Ready node --all --timeout={{ postchecks_node_timeout }}
+  changed_when: false
+
+# ── Deployment rollouts ───────────────────────────────────────
+- name: "Post-check: wait for coredns deployment"
+  command: /usr/local/bin/k3s kubectl rollout status deployment/coredns -n kube-system --timeout={{ postchecks_rollout_timeout }}
+  changed_when: false
+
+- name: "Post-check: wait for metrics-server deployment"
+  command: /usr/local/bin/k3s kubectl rollout status deployment/metrics-server -n kube-system --timeout={{ postchecks_rollout_timeout }}
+  changed_when: false
+
+- name: "Post-check: wait for local-path-provisioner deployment"
+  command: /usr/local/bin/k3s kubectl rollout status deployment/local-path-provisioner -n kube-system --timeout={{ postchecks_rollout_timeout }}
+  changed_when: false
+
+- name: "Post-check: wait for cilium-operator deployment"
+  command: /usr/local/bin/k3s kubectl rollout status deployment/cilium-operator -n kube-system --timeout={{ postchecks_rollout_timeout }}
+  changed_when: false
+
+# ── DaemonSet rollouts ────────────────────────────────────────
+- name: "Post-check: wait for cilium DaemonSet"
+  command: /usr/local/bin/k3s kubectl rollout status daemonset/cilium -n kube-system --timeout={{ postchecks_rollout_timeout }}
+  changed_when: false
+
+- name: "Post-check: wait for nvidia-device-plugin pods"
+  shell: |
+    PODS=$(/usr/local/bin/k3s kubectl get pods -l app.kubernetes.io/name=nvidia-device-plugin -n kube-system --no-headers 2>/dev/null | wc -l)
+    if [ "$PODS" -eq 0 ]; then
+      echo "No nvidia-device-plugin pods scheduled (node labels may be required)"
+      exit 0
+    fi
+    /usr/local/bin/k3s kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=nvidia-device-plugin -n kube-system --timeout={{ postchecks_rollout_timeout }}
+  changed_when: false
+  when: nvidia_gpu_present | default(false) | bool
+
+# ── Comprehensive pod readiness verification ──────────────────
+- name: "Post-check: verify all kube-system pods are Running with all containers Ready"
+  shell: |
+    set -e
+    ISSUES=""
+    while IFS= read -r line; do
+      [ -z "$line" ] && continue
+      NAME=$(echo "$line" | awk '{print $1}')
+      READY=$(echo "$line" | awk '{print $2}')
+      STATUS=$(echo "$line" | awk '{print $3}')
+      case "$STATUS" in Completed|Succeeded) continue;; esac
+      if [ "$STATUS" != "Running" ]; then
+        ISSUES="${ISSUES}  ${NAME} status=${STATUS}\n"
+        continue
+      fi
+      READY_COUNT=$(echo "$READY" | cut -d/ -f1)
+      TOTAL_COUNT=$(echo "$READY" | cut -d/ -f2)
+      if [ "$READY_COUNT" != "$TOTAL_COUNT" ]; then
+        ISSUES="${ISSUES}  ${NAME} containers not ready: ${READY}\n"
+      fi
+    done < <(/usr/local/bin/k3s kubectl get pods -n kube-system --no-headers)
+    if [ -n "$ISSUES" ]; then
+      printf "UNHEALTHY pods in kube-system:\n%b" "$ISSUES"
+      exit 1
+    fi
+    echo "All kube-system pods are Running with all containers Ready"
+  args:
+    executable: /bin/bash
+  register: final_health
+  retries: "{{ postchecks_pod_health_retries }}"
+  delay: "{{ postchecks_pod_health_delay }}"
+  until: final_health.rc == 0
+  changed_when: false
+
+# ── Final cluster state ───────────────────────────────────────
+- name: "Post-check: display final cluster state"
+  shell: |
+    echo "=== Nodes ==="
+    /usr/local/bin/k3s kubectl get nodes -o wide
+    echo ""
+    echo "=== System Pods ==="
+    /usr/local/bin/k3s kubectl get pods -n kube-system -o wide
+  register: final_state
+  changed_when: false
+
+- name: Cluster status
+  debug:
+    msg: "{{ final_state.stdout_lines }}"

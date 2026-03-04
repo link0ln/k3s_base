@@ -1,0 +1,11 @@
+[Unit]
+Description=Fix rp_filter on Cilium lxc interfaces (WSL2 workaround)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/bin/bash -c 'while true; do for f in /proc/sys/net/ipv4/conf/lxc*/rp_filter; do [ -f "$f" ] && echo 0 > "$f"; done; sleep 3; done'
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

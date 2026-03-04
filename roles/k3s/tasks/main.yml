@@ -1,0 +1,79 @@
+---
+# ── k3s config (BEFORE installation) ────────────────────────
+- name: Ensure /etc/rancher/k3s directory exists
+  file:
+    path: /etc/rancher/k3s
+    state: directory
+    mode: '0755'
+
+- name: Manage k3s config.yaml via blockinfile
+  blockinfile:
+    path: /etc/rancher/k3s/config.yaml
+    create: yes
+    mode: '0644'
+    marker: "# {mark} ANSIBLE MANAGED BLOCK"
+    block: "{{ lookup('template', 'k3s-config.yaml.j2') }}"
+  notify: Restart k3s
+
+# ── k3s installation ────────────────────────────────────────
+- name: Check if k3s is already installed
+  stat:
+    path: /usr/local/bin/k3s
+  register: k3s_binary
+
+- name: Download k3s install script
+  get_url:
+    url: "{{ k3s_install_url }}"
+    dest: /tmp/k3s-install.sh
+    mode: '0755'
+    timeout: 60
+  when: not k3s_binary.stat.exists
+
+- name: Install k3s server
+  command: bash /tmp/k3s-install.sh
+  args:
+    creates: /usr/local/bin/k3s
+  environment:
+    INSTALL_K3S_EXEC: server
+
+- name: Ensure k3s service is enabled and started
+  service:
+    name: k3s
+    state: started
+    enabled: yes
+
+- name: Wait for k3s kubeconfig to appear
+  wait_for:
+    path: "{{ k3s_kubeconfig_remote }}"
+    state: present
+    timeout: 120
+
+- name: Wait for k3s API to become available
+  command: /usr/local/bin/k3s kubectl get nodes
+  register: k3s_ready
+  retries: "{{ k3s_api_retries }}"
+  delay: "{{ k3s_api_delay }}"
+  until: k3s_ready.rc == 0
+  changed_when: false
+
+# ── Fetch kubeconfig ────────────────────────────────────────
+- name: Read kubeconfig from remote
+  slurp:
+    src: "{{ k3s_kubeconfig_remote }}"
+  register: kubeconfig_raw
+
+- name: Write kubeconfig locally with corrected server address
+  copy:
+    content: "{{ kubeconfig_raw.content | b64decode | replace('127.0.0.1', ansible_host) | replace('localhost', ansible_host) }}"
+    dest: "{{ k3s_kubeconfig_local }}"
+    mode: '0600'
+  delegate_to: localhost
+  become: false
+
+# ── Helm installation ───────────────────────────────────────
+- name: Install Helm
+  shell: curl -fsSL {{ helm_install_url }} | bash
+  args:
+    creates: /usr/local/bin/helm
+  environment:
+    KUBECONFIG: "{{ k3s_kubeconfig_remote }}"

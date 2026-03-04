@@ -1,0 +1,21 @@
+---
+argocd_namespace: argocd
+argocd_helm_repo_url: https://argoproj.github.io/argo-helm
+argocd_helm_repo_name: argo
+argocd_chart_name: argo-cd
+argocd_release_name: argocd
+argocd_password_length: 24
+argocd_password_file: "{{ playbook_dir }}/artifacts/argocd-admin-password"
+argocd_helm_timeout: 600s
+argocd_wait_timeout: 300s
+
+# ArgoCD Application
+argocd_app_name: k3s-base
+argocd_app_repo: https://github.com/link0ln/k3s_base.git
+argocd_app_path: argocd
+argocd_app_target_revision: main
+argocd_app_project: default
+argocd_app_dest_server: https://kubernetes.default.svc
+argocd_app_dest_namespace: default
+argocd_app_prune: true
+argocd_app_self_heal: true

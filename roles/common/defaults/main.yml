@@ -1,0 +1,19 @@
+---
+common_packages:
+  - net-tools
+  - mc
+  - dstat
+  - htop
+  - curl
+  - wget
+  - vim
+  - jq
+  - lsof
+  - iotop
+  - tcpdump
+  - unzip
+  - git
+  - apt-transport-https
+  - ca-certificates
+  - gnupg
+  - pciutils

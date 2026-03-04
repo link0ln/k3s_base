@@ -1,0 +1,283 @@
+---
+# ── NVIDIA GPU support ──────────────────────────────────────
+- name: Check if NVIDIA GPU is present
+  shell: lspci | grep -i nvidia
+  register: nvidia_check
+  changed_when: false
+  failed_when: false
+
+- name: Set nvidia_gpu_present fact
+  set_fact:
+    nvidia_gpu_present: "{{ nvidia_check.rc == 0 }}"
+
+- name: Check for NVIDIA GPU via WSL lib (fallback)
+  stat:
+    path: /usr/lib/wsl/lib/nvidia-smi
+  register: wsl_nvidia_smi_stat
+  when:
+    - is_wsl | bool
+    - not (nvidia_gpu_present | bool)
+
+- name: Update nvidia_gpu_present for WSL
+  set_fact:
+    nvidia_gpu_present: true
+  when:
+    - is_wsl | bool
+    - not (nvidia_gpu_present | bool)
+    - wsl_nvidia_smi_stat.stat.exists | default(false)
+
+- name: Ensure /usr/lib/wsl/lib is in system PATH (WSL)
+  copy:
+    content: 'export PATH="/usr/lib/wsl/lib:$PATH"'
+    dest: /etc/profile.d/wsl-nvidia.sh
+    mode: '0644'
+  when:
+    - is_wsl | bool
+    - nvidia_gpu_present | bool
+
+# ── NVIDIA driver installation ──
+- name: Check if NVIDIA driver is already loaded
+  shell: "{{ '/usr/lib/wsl/lib/nvidia-smi' if (is_wsl | bool) else 'nvidia-smi' }}"
+  register: nvidia_smi_check
+  changed_when: false
+  failed_when: false
+  when: nvidia_gpu_present | bool
+
+- name: Install NVIDIA CUDA toolkit (WSL)
+  block:
+    - name: Download CUDA keyring package
+      get_url:
+        url: "{{ nvidia_cuda_keyring_url }}"
+        dest: /tmp/cuda-keyring_1.1-1_all.deb
+        mode: '0644'
+
+    - name: Install CUDA keyring package
+      apt:
+        deb: /tmp/cuda-keyring_1.1-1_all.deb
+
+    - name: Update apt cache after adding CUDA repo
+      apt:
+        update_cache: yes
+
+    - name: Install cuda-toolkit
+      apt:
+        name: cuda-toolkit
+        state: present
+  when:
+    - nvidia_gpu_present | bool
+    - is_wsl | bool
+    - nvidia_smi_check.rc != 0
+
+- name: Install NVIDIA driver (ubuntu-drivers)
+  block:
+    - name: Install ubuntu-drivers-common
+      apt:
+        name: ubuntu-drivers-common
+        state: present
+
+    - name: Detect recommended NVIDIA driver
+      command: ubuntu-drivers devices
+      register: ubuntu_drivers_output
+      changed_when: false
+
+    - name: Install recommended NVIDIA drivers
+      command: ubuntu-drivers autoinstall
+      register: nvidia_driver_install
+      changed_when: "'is already the newest version' not in nvidia_driver_install.stdout"
+  when:
+    - nvidia_gpu_present | bool
+    - nvidia_smi_check.rc != 0
+    - not (is_wsl | bool)
+
+# ── NVIDIA Container Toolkit ──
+- name: Install NVIDIA container toolkit
+  block:
+    - name: Add NVIDIA container toolkit GPG key (modern approach)
+      shell: >
+        curl -fsSL {{ nvidia_container_toolkit_gpg_url }}
+        | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+      args:
+        creates: /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+
+    - name: Download NVIDIA container toolkit repo list
+      get_url:
+        url: "{{ nvidia_container_toolkit_list_url }}"
+        dest: /tmp/nvidia-container-toolkit.list
+        mode: '0644'
+        timeout: 30
+        force: false
+
+    - name: Add signed-by to NVIDIA repo list and install
+      shell: >
+        sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g'
+        /tmp/nvidia-container-toolkit.list
+        > /etc/apt/sources.list.d/nvidia-container-toolkit.list
+      args:
+        creates: /etc/apt/sources.list.d/nvidia-container-toolkit.list
+
+    - name: Update apt cache after adding NVIDIA repo
+      apt:
+        update_cache: yes
+
+    - name: Install nvidia-container-toolkit
+      apt:
+        name: nvidia-container-toolkit
+        state: present
+  when: nvidia_gpu_present | bool
+
+# ── Configure containerd for NVIDIA runtime ──
+- name: Ensure k3s containerd config directory exists
+  file:
+    path: /var/lib/rancher/k3s/agent/etc/containerd
+    state: directory
+    mode: '0755'
+  when: nvidia_gpu_present | bool
+
+- name: Configure NVIDIA container runtime for k3s containerd
+  command: >
+    nvidia-ctk runtime configure
+    --runtime=containerd
+    --config=/var/lib/rancher/k3s/agent/etc/containerd/config.toml.tmpl
+    --set-as-default
+  args:
+    creates: /var/lib/rancher/k3s/agent/etc/containerd/config.toml.tmpl
+  register: nvidia_ctk_config
+  when: nvidia_gpu_present | bool
+  notify: Restart k3s
+
+- name: Flush handlers to restart k3s with NVIDIA runtime
+  meta: flush_handlers
+
+- name: Wait for k3s API after NVIDIA runtime restart
+  command: /usr/local/bin/k3s kubectl get nodes
+  register: k3s_ready_nvidia
+  retries: "{{ nvidia_api_retries }}"
+  delay: "{{ nvidia_api_delay }}"
+  until: k3s_ready_nvidia.rc == 0
+  changed_when: false
+  when: nvidia_gpu_present | bool
+
+# After k3s restart, Cilium BPF needs time to initialize.
+# System pods that start before Cilium is ready get broken networking.
+- name: Wait for Cilium agent after NVIDIA runtime restart
+  command: >
+    /usr/local/bin/k3s kubectl wait
+    --for=condition=ready pod
+    -l app.kubernetes.io/name=cilium-agent
+    -n kube-system
+    --timeout={{ nvidia_cilium_wait_timeout }}
+  register: cilium_nvidia_wait
+  retries: "{{ nvidia_cilium_wait_retries }}"
+  delay: "{{ nvidia_cilium_wait_delay }}"
+  until: cilium_nvidia_wait.rc == 0
+  changed_when: false
+  when: nvidia_gpu_present | bool
+
+- name: Restart system pods after NVIDIA k3s restart
+  shell: |
+    /usr/local/bin/k3s kubectl rollout restart deployment coredns -n kube-system
+    /usr/local/bin/k3s kubectl rollout restart deployment metrics-server -n kube-system
+    /usr/local/bin/k3s kubectl rollout restart deployment local-path-provisioner -n kube-system
+  when: nvidia_ctk_config is changed
+
+- name: Wait for system pod rollouts after NVIDIA k3s restart
+  shell: |
+    /usr/local/bin/k3s kubectl rollout status deployment coredns -n kube-system --timeout={{ nvidia_rollout_timeout }}
+    /usr/local/bin/k3s kubectl rollout status deployment metrics-server -n kube-system --timeout={{ nvidia_rollout_timeout }}
+    /usr/local/bin/k3s kubectl rollout status deployment local-path-provisioner -n kube-system --timeout={{ nvidia_rollout_timeout }}
+  changed_when: false
+  when: nvidia_ctk_config is changed
+
+# ── NVIDIA RuntimeClass for Kubernetes ──
+- name: Create NVIDIA RuntimeClass manifest
+  copy:
+    content: |
+      apiVersion: node.k8s.io/v1
+      kind: RuntimeClass
+      metadata:
+        name: {{ nvidia_runtime_class_name }}
+      handler: {{ nvidia_runtime_class_name }}
+    dest: /var/lib/rancher/k3s/server/manifests/nvidia-runtime-class.yaml
+    mode: '0644'
+  when: nvidia_gpu_present | bool
+
+# ── NVIDIA Device Plugin via Helm ──
+- name: Add NVIDIA device plugin Helm repository
+  command: /usr/local/bin/helm repo add {{ nvidia_device_plugin_repo_name }} {{ nvidia_device_plugin_repo_url }}
+  register: nvdp_repo_add
+  changed_when: "'has been added' in nvdp_repo_add.stdout"
+  failed_when: nvdp_repo_add.rc != 0 and 'already exists' not in nvdp_repo_add.stderr
+  retries: "{{ nvidia_device_plugin_helm_retries }}"
+  delay: "{{ nvidia_device_plugin_helm_delay }}"
+  until: nvdp_repo_add.rc == 0 or 'already exists' in (nvdp_repo_add.stderr | default(''))
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  when: nvidia_gpu_present | bool
+
+- name: Update Helm repositories (after NVIDIA repo)
+  command: /usr/local/bin/helm repo update
+  changed_when: false
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  when: nvidia_gpu_present | bool
+
+- name: Check if NVIDIA device plugin is already up to date
+  shell: |
+    set -e
+    VALS=$(/usr/local/bin/helm get values nvidia-device-plugin -n kube-system -o json 2>/dev/null) || exit 1
+    DEPLOYED_VER=$(/usr/local/bin/helm list -n kube-system -f '^nvidia-device-plugin$' -o json | jq -r '.[0].chart' | sed 's/^nvidia-device-plugin-//')
+    LATEST_VER=$(/usr/local/bin/helm search repo {{ nvidia_device_plugin_repo_name }}/nvidia-device-plugin -o json | jq -r '.[0].version')
+    if [ "$DEPLOYED_VER" != "$LATEST_VER" ]; then
+      echo "Chart upgrade needed: ${DEPLOYED_VER} -> ${LATEST_VER}"
+      exit 1
+    fi
+    echo "$VALS" | jq -e '
+      .runtimeClassName == "{{ nvidia_runtime_class_name }}" and
+      .deviceListStrategy == "{{ nvidia_device_list_strategy }}"
+    ' > /dev/null 2>&1 || { echo "Values differ from desired"; exit 1; }
+    echo "NVIDIA device plugin is up to date (version ${DEPLOYED_VER})"
+  register: nvdp_up_to_date
+  changed_when: false
+  failed_when: false
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  when: nvidia_gpu_present | bool
+
+- name: Install or upgrade NVIDIA device plugin
+  command: >
+    /usr/local/bin/helm upgrade --install nvidia-device-plugin {{ nvidia_device_plugin_repo_name }}/nvidia-device-plugin
+    --namespace kube-system
+    --set runtimeClassName={{ nvidia_runtime_class_name }}
+    --set deviceListStrategy={{ nvidia_device_list_strategy }}
+  register: nvdp_install
+  changed_when: "'has been upgraded' in nvdp_install.stdout or 'has been installed' in nvdp_install.stdout"
+  when:
+    - nvidia_gpu_present | bool
+    - nvdp_up_to_date.rc | default(1) != 0
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+
+- name: Wait for NVIDIA device plugin to be ready
+  shell: |
+    PODS=$(/usr/local/bin/k3s kubectl get pods -l app.kubernetes.io/name=nvidia-device-plugin -n kube-system --no-headers 2>/dev/null | wc -l)
+    if [ "$PODS" -eq 0 ]; then
+      echo "No nvidia-device-plugin pods scheduled (node labels may be required)"
+      exit 0
+    fi
+    /usr/local/bin/k3s kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=nvidia-device-plugin -n kube-system --timeout={{ nvidia_device_plugin_wait_timeout }}
+  changed_when: false
+  when: nvidia_gpu_present | bool
+
+# ── GPU verification ──
+- name: Verify GPU is visible in Kubernetes
+  command: /usr/local/bin/k3s kubectl get nodes -o jsonpath='{.items[*].status.allocatable.nvidia\.com/gpu}'
+  register: gpu_allocatable
+  changed_when: false
+  when: nvidia_gpu_present | bool
+
+- name: GPU support status
+  debug:
+    msg: >-
+      {{ 'NVIDIA GPU detected. Allocatable GPUs: ' + (gpu_allocatable.stdout | default('checking...'))
+         if (nvidia_gpu_present | bool)
+         else 'No NVIDIA GPU detected — GPU support tasks skipped' }}

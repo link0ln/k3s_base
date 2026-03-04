@@ -29,17 +29,16 @@ ssh -i artifacts/id_ed25519 -o StrictHostKeyChecking=no root@192.168.196.67
 
 ## Architecture
 
-**Single playbook design** — `playbook.yml` is the sole orchestration file (~550 lines) with this deployment flow:
+**Role-based playbook design** — `playbook.yml` is a thin orchestrator (~45 lines) with `pre_tasks` and a list of roles. Each role handles one concern:
 
-1. **SSH key generation** (local) — Ed25519 keypair in `artifacts/`
-2. **System setup** (remote) — apt packages, root SSH key deployment, PermitRootLogin enabled
-3. **K3s install** (remote) — config from `templates/k3s-config.yaml.j2`, then install via get.k3s.io
-4. **kubeconfig fetch** (local) — pulled from remote, server address corrected from 127.0.0.1 to real IP
-5. **Cilium CNI** (remote) — installed via Helm, replaces both Flannel and kube-proxy (eBPF-based)
-6. **System pod recovery** — restarts coredns, metrics-server, local-path-provisioner after CNI swap
-7. **Storage config** — patches local-path-provisioner to use `/k3s-storage`
-8. **NVIDIA GPU** (conditional) — detects GPU via `lspci`, installs driver + container toolkit + device plugin
-9. **Post-checks** — verifies all nodes Ready, all deployments/daemonsets rolled out, all kube-system pods Running with all containers ready (retries up to 10 times)
+1. **pre_tasks** (in playbook) — SSH keypair generation (local), PermitRootLogin, sshd restart
+2. **common** — apt packages, SSH key deployment, WSL detection (`is_wsl` fact), rp_filter workaround
+3. **k3s** — config via blockinfile, k3s install, service start, kubeconfig fetch, Helm install
+4. **cilium** — Helm install, idempotency check, BPF cleanup on upgrade, system pod recovery
+5. **storage** — patches local-path-provisioner configmap to use `/k3s-storage`
+6. **nvidia** — GPU detection (lspci + WSL fallback), driver, container toolkit, containerd config, RuntimeClass, device plugin Helm
+7. **argocd** — Helm install with password management, deploys ArgoCD Application pointing to `argocd/` dir in this repo
+8. **postchecks** — cleanup stale pods, node readiness, deployment/daemonset rollouts, comprehensive pod health check
 
 **Key design decisions:**
 - Flannel disabled (`flannel-backend: "none"`) — Cilium is the sole CNI
@@ -52,16 +51,31 @@ ssh -i artifacts/id_ed25519 -o StrictHostKeyChecking=no root@192.168.196.67
 - `creates:` arguments on commands to skip re-runs
 - `when:` conditions gating conditional blocks (e.g., NVIDIA tasks only run when GPU detected)
 - `changed_when:` / `failed_when:` to accurately report task state
-- Two handlers (`Restart sshd`, `Restart k3s`) with `flush_handlers` to apply restarts at specific points in the flow
+- Handler `Restart sshd` in playbook, `Restart k3s` in k3s role — both globally visible within the play
+- `flush_handlers` used in nvidia role to trigger k3s restart mid-play
+
+**Inter-role dependencies:**
+- `is_wsl` fact: set in `common`, used in `nvidia`
+- `nvidia_gpu_present` fact: set in `nvidia`, used in `postchecks` (with `default(false)`)
+- `Restart k3s` handler: defined in `k3s` role, notified from `nvidia` role
+- All static config lives in each role's `defaults/main.yml`
 
 ## Key Files
 
-- `playbook.yml` — all tasks, pre-tasks, and handlers in one file
+- `playbook.yml` — pre_tasks + role list (~45 lines)
 - `inventory.ini` — target host definition (IP, credentials, SSH args)
 - `ansible.cfg` — points to inventory, sets private key path, enables pipelining
-- `templates/k3s-config.yaml.j2` — K3s server config (TLS SAN, disabled components)
-- `artifacts/` — generated SSH keys and kubeconfig (sensitive files are git-ignored)
+- `argocd/kustomization.yml` — Kustomize root for ArgoCD Application (add manifests here)
+- `roles/` — all logic split by concern:
+  - `common/` — packages, SSH, WSL detect, rp_filter fix (with `files/cilium-rp-filter-fix.service`)
+  - `k3s/` — install, config (`templates/k3s-config.yaml.j2`), kubeconfig, Helm
+  - `cilium/` — CNI via Helm, BPF cleanup, system pod recovery
+  - `storage/` — local-path-provisioner config
+  - `nvidia/` — GPU driver, toolkit, device plugin
+  - `argocd/` — Helm install, password management, Application deployment (`templates/argocd-application.yml.j2`)
+  - `postchecks/` — health checks and final state display
+- `artifacts/` — generated SSH keys, kubeconfig, and ArgoCD admin password (sensitive files are git-ignored)
 
 ## Sensitive Files
 
-`artifacts/id_ed25519` and `artifacts/kubeconfig` are git-ignored and contain cluster credentials. The public key `artifacts/id_ed25519.pub` and `.gitkeep` are tracked.
+`artifacts/id_ed25519`, `artifacts/kubeconfig`, and `artifacts/argocd-admin-password` are git-ignored and contain cluster credentials. The public key `artifacts/id_ed25519.pub` and `.gitkeep` are tracked.

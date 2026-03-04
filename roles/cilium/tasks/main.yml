@@ -1,0 +1,157 @@
+---
+# ── Cilium installation via Helm ────────────────────────────
+- name: Check if Cilium is already running
+  command: /usr/local/bin/k3s kubectl get daemonset cilium -n kube-system
+  register: cilium_pre_check
+  changed_when: false
+  failed_when: false
+
+- name: Add Cilium Helm repository
+  command: /usr/local/bin/helm repo add cilium {{ cilium_helm_repo_url }}
+  register: helm_repo_add
+  changed_when: "'has been added' in helm_repo_add.stdout"
+  failed_when: helm_repo_add.rc != 0 and 'already exists' not in helm_repo_add.stderr
+  retries: "{{ cilium_helm_retries }}"
+  delay: "{{ cilium_helm_delay }}"
+  until: helm_repo_add.rc == 0 or 'already exists' in (helm_repo_add.stderr | default(''))
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+
+- name: Update Helm repositories
+  command: /usr/local/bin/helm repo update
+  changed_when: false
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+
+- name: Check if Cilium is already up to date
+  shell: |
+    set -e
+    VALS=$(/usr/local/bin/helm get values cilium -n kube-system -o json 2>/dev/null) || exit 1
+    DEPLOYED_VER=$(/usr/local/bin/helm list -n kube-system -f '^cilium$' -o json | jq -r '.[0].chart' | sed 's/^cilium-//')
+    LATEST_VER=$(/usr/local/bin/helm search repo cilium/cilium -o json | jq -r '.[0].version')
+    if [ "$DEPLOYED_VER" != "$LATEST_VER" ]; then
+      echo "Chart upgrade needed: ${DEPLOYED_VER} -> ${LATEST_VER}"
+      exit 1
+    fi
+    echo "$VALS" | jq -e '
+      .kubeProxyReplacement == {{ cilium_kube_proxy_replacement | lower }} and
+      .k8sServiceHost == "{{ ansible_host }}" and
+      (.k8sServicePort == 6443 or .k8sServicePort == "6443") and
+      .operator.replicas == {{ cilium_operator_replicas }} and
+      .bpf.enableTCX == {{ cilium_bpf_enable_tcx | lower }} and
+      .bpf.masquerade == {{ cilium_bpf_masquerade | lower }} and
+      .bpf.hostLegacyRouting == {{ cilium_bpf_host_legacy_routing | lower }} and
+      .routingMode == "{{ cilium_routing_mode }}" and
+      .autoDirectNodeRoutes == {{ cilium_auto_direct_node_routes | lower }} and
+      .socketLB.hostNamespaceOnly == {{ cilium_socket_lb_host_ns_only | lower }}
+    ' > /dev/null 2>&1 || { echo "Values differ from desired"; exit 1; }
+    echo "Cilium is up to date (version ${DEPLOYED_VER})"
+  register: cilium_up_to_date
+  changed_when: false
+  failed_when: false
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+
+- name: Install or upgrade Cilium
+  command: >
+    /usr/local/bin/helm upgrade --install cilium cilium/cilium
+    --namespace kube-system
+    --set kubeProxyReplacement={{ cilium_kube_proxy_replacement }}
+    --set k8sServiceHost={{ ansible_host }}
+    --set k8sServicePort=6443
+    --set operator.replicas={{ cilium_operator_replicas }}
+    --set bpf.enableTCX={{ cilium_bpf_enable_tcx }}
+    --set bpf.masquerade={{ cilium_bpf_masquerade }}
+    --set bpf.hostLegacyRouting={{ cilium_bpf_host_legacy_routing }}
+    --set routingMode={{ cilium_routing_mode }}
+    --set ipv4NativeRoutingCIDR={{ cilium_native_routing_cidr }}
+    --set autoDirectNodeRoutes={{ cilium_auto_direct_node_routes }}
+    --set socketLB.hostNamespaceOnly={{ cilium_socket_lb_host_ns_only }}
+  register: cilium_install
+  changed_when: "'has been upgraded' in cilium_install.stdout or 'has been installed' in cilium_install.stdout"
+  when: cilium_up_to_date.rc != 0
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+
+- name: Wait for Cilium agent pods to be ready
+  command: >
+    /usr/local/bin/k3s kubectl wait
+    --for=condition=ready pod
+    -l app.kubernetes.io/name=cilium-agent
+    -n kube-system
+    --timeout={{ cilium_wait_timeout }}
+  changed_when: false
+
+# ── Post-Cilium: fix eBPF/TCX state after upgrade ──────────────────
+- name: Restart k3s with BPF cleanup after Cilium upgrade
+  block:
+    - name: Stop k3s for BPF state cleanup
+      service:
+        name: k3s
+        state: stopped
+
+    - name: Remove stale Cilium network interfaces and BPF state
+      shell: |
+        ip link delete cilium_host 2>/dev/null || true
+        ip link delete cilium_vxlan 2>/dev/null || true
+        for iface in $(ip link show type veth 2>/dev/null | grep 'lxc' | awk '{print $2}' | cut -d@ -f1 | tr -d ':'); do
+          ip link delete "$iface" 2>/dev/null || true
+        done
+        find /sys/fs/bpf -name 'cilium*' -exec rm -rf {} + 2>/dev/null || true
+        rm -rf /sys/fs/bpf/tc/globals/cilium* 2>/dev/null || true
+      changed_when: true
+
+    - name: Start k3s after BPF cleanup
+      service:
+        name: k3s
+        state: started
+
+    - name: Wait for k3s API after BPF cleanup
+      command: /usr/local/bin/k3s kubectl get nodes
+      register: k3s_api_bpf_recovery
+      retries: "{{ cilium_bpf_recovery_api_retries }}"
+      delay: "{{ cilium_bpf_recovery_api_delay }}"
+      until: k3s_api_bpf_recovery.rc == 0
+      changed_when: false
+
+    - name: Delete Cilium agent pods to force full recreation
+      command: >
+        /usr/local/bin/k3s kubectl delete pods
+        -l app.kubernetes.io/name=cilium-agent
+        -n kube-system
+        --force --grace-period=0
+      changed_when: true
+
+    - name: Wait for new Cilium agent pods after BPF cleanup
+      command: >
+        /usr/local/bin/k3s kubectl wait
+        --for=condition=ready pod
+        -l app.kubernetes.io/name=cilium-agent
+        -n kube-system
+        --timeout={{ cilium_wait_timeout }}
+      register: cilium_wait_bpf
+      retries: "{{ cilium_bpf_recovery_cilium_retries }}"
+      delay: "{{ cilium_bpf_recovery_cilium_delay }}"
+      until: cilium_wait_bpf.rc == 0
+      changed_when: false
+  when:
+    - cilium_pre_check.rc == 0
+    - cilium_install is changed
+
+# Fresh install: pods started without CNI and need restart.
+# Upgrade: pods may have broken networking from corrupted eBPF maps.
+# No-op: skip — pods already have working networking.
+- name: Rollout restart system pods after Cilium change
+  shell: |
+    /usr/local/bin/k3s kubectl rollout restart deployment coredns -n kube-system
+    /usr/local/bin/k3s kubectl rollout restart deployment metrics-server -n kube-system
+    /usr/local/bin/k3s kubectl rollout restart deployment local-path-provisioner -n kube-system
+  when: cilium_install is changed
+
+- name: Wait for system pod rollouts after Cilium change
+  shell: |
+    /usr/local/bin/k3s kubectl rollout status deployment coredns -n kube-system --timeout={{ cilium_rollout_timeout }}
+    /usr/local/bin/k3s kubectl rollout status deployment metrics-server -n kube-system --timeout={{ cilium_rollout_timeout }}
+    /usr/local/bin/k3s kubectl rollout status deployment local-path-provisioner -n kube-system --timeout={{ cilium_rollout_timeout }}
+  changed_when: false
+  when: cilium_install is changed
