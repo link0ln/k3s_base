@@ -13,8 +13,8 @@ spec:
         cpu: 50m
         memory: 64Mi
       max:
-        cpu: "2"
-        memory: 2Gi
+        cpu: "20"
+        memory: 80Gi
         nvidia.com/gpu: "1"
       min:
         cpu: 10m
