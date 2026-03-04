@@ -15,7 +15,6 @@ spec:
       max:
         cpu: "20"
         memory: 80Gi
-        nvidia.com/gpu: "1"
       min:
         cpu: 10m
         memory: 16Mi
@@ -23,4 +22,3 @@ spec:
       max:
         cpu: "2"
         memory: 2Gi
-        nvidia.com/gpu: "1"
