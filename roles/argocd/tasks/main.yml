@@ -114,13 +114,9 @@
 
 # ── Deploy ArgoCD Application ─────────────────────────────────────
 - name: Deploy ArgoCD Application for k3s-base
-  shell: >
-    /usr/local/bin/k3s kubectl apply -f -
-    <<'EOF'
-    {{ lookup('template', 'argocd-application.yml.j2') }}
-    EOF
+  command: /usr/local/bin/k3s kubectl apply -f -
   args:
-    executable: /bin/bash
+    stdin: "{{ lookup('template', 'argocd-application.yml.j2') }}"
   register: argocd_app_apply
   changed_when: "'created' in argocd_app_apply.stdout or 'configured' in argocd_app_apply.stdout"
 
