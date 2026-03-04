@@ -104,7 +104,7 @@
     - name: "NET-04: public egress must work"
       command: >
         kubectl exec {{ test_pod }} -n {{ ns }} --
-        wget -q -O /dev/null --timeout=10 https://httpbin.org/ip
+        wget -q -O /dev/null --timeout=10 http://httpbin.org/ip
       register: net04
       failed_when: false
       changed_when: false
@@ -406,9 +406,9 @@
           changed_when: false
 
         - name: "INGRESS-01: start listener in test pod"
-          command: >
+          shell: >
             kubectl exec {{ test_pod }} -n {{ ns }} --
-            sh -c 'nc -l -p 8080 &'
+            sh -c 'nc -l -p 8080 > /dev/null 2>&1 &' &
           failed_when: false
           changed_when: false
 
