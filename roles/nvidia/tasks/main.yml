@@ -201,6 +201,17 @@
     mode: '0644'
   when: nvidia_gpu_present | bool
 
+# ── Label node for NVIDIA device plugin scheduling ──
+# In WSL there is no PCI bus, so NFD cannot detect GPU via lspci.
+# The device plugin DaemonSet requires one of these labels to schedule.
+- name: Label node with nvidia.com/gpu.present=true
+  command: >
+    /usr/local/bin/k3s kubectl label node {{ ansible_hostname | lower }}
+    nvidia.com/gpu.present=true --overwrite
+  register: nvidia_label
+  changed_when: "'labeled' in nvidia_label.stdout"
+  when: nvidia_gpu_present | bool
+
 # ── NVIDIA Device Plugin via Helm ──
 - name: Add NVIDIA device plugin Helm repository
   command: /usr/local/bin/helm repo add {{ nvidia_device_plugin_repo_name }} {{ nvidia_device_plugin_repo_url }}
@@ -258,13 +269,14 @@
     KUBECONFIG: /etc/rancher/k3s/k3s.yaml
 
 - name: Wait for NVIDIA device plugin to be ready
-  shell: |
-    PODS=$(/usr/local/bin/k3s kubectl get pods -l app.kubernetes.io/name=nvidia-device-plugin -n kube-system --no-headers 2>/dev/null | wc -l)
-    if [ "$PODS" -eq 0 ]; then
-      echo "No nvidia-device-plugin pods scheduled (node labels may be required)"
-      exit 0
-    fi
-    /usr/local/bin/k3s kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=nvidia-device-plugin -n kube-system --timeout={{ nvidia_device_plugin_wait_timeout }}
+  command: >
+    /usr/local/bin/k3s kubectl wait --for=condition=ready pod
+    -l app.kubernetes.io/name=nvidia-device-plugin
+    -n kube-system --timeout={{ nvidia_device_plugin_wait_timeout }}
+  register: nvdp_wait
+  retries: 3
+  delay: 10
+  until: nvdp_wait.rc == 0
   changed_when: false
   when: nvidia_gpu_present | bool
 

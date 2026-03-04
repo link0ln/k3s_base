@@ -53,13 +53,10 @@
   changed_when: false
 
 - name: "Post-check: wait for nvidia-device-plugin pods"
-  shell: |
-    PODS=$(/usr/local/bin/k3s kubectl get pods -l app.kubernetes.io/name=nvidia-device-plugin -n kube-system --no-headers 2>/dev/null | wc -l)
-    if [ "$PODS" -eq 0 ]; then
-      echo "No nvidia-device-plugin pods scheduled (node labels may be required)"
-      exit 0
-    fi
-    /usr/local/bin/k3s kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=nvidia-device-plugin -n kube-system --timeout={{ postchecks_rollout_timeout }}
+  command: >
+    /usr/local/bin/k3s kubectl wait --for=condition=ready pod
+    -l app.kubernetes.io/name=nvidia-device-plugin
+    -n kube-system --timeout={{ postchecks_rollout_timeout }}
   changed_when: false
   when: nvidia_gpu_present | default(false) | bool
 
