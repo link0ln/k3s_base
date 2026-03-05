@@ -2,6 +2,9 @@ write-kubeconfig-mode: "0644"
 bind-address: "0.0.0.0"
 tls-san:
   - "{{ ansible_host }}"
+{% for san in k3s_tls_san_extra %}
+  - "{{ san }}"
+{% endfor %}
 flannel-backend: "none"
 disable-network-policy: true
 disable:
