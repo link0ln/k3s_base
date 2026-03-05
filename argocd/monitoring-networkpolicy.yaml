@@ -1,0 +1,88 @@
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: monitoring-default
+  namespace: monitoring
+spec:
+  endpointSelector: {}
+  ingress: []
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            io.kubernetes.pod.namespace: kube-system
+            k8s-app: kube-dns
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: UDP
+            - port: "53"
+              protocol: TCP
+    - toEntities:
+        - kube-apiserver
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: node-exporter-policy
+  namespace: monitoring
+spec:
+  endpointSelector:
+    matchLabels:
+      app: node-exporter
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            app: vmsingle
+      toPorts:
+        - ports:
+            - port: "9100"
+              protocol: TCP
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: vmsingle-policy
+  namespace: monitoring
+spec:
+  endpointSelector:
+    matchLabels:
+      app: vmsingle
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            app: grafana
+      toPorts:
+        - ports:
+            - port: "8428"
+              protocol: TCP
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            app: node-exporter
+      toPorts:
+        - ports:
+            - port: "9100"
+              protocol: TCP
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: grafana-policy
+  namespace: monitoring
+spec:
+  endpointSelector:
+    matchLabels:
+      app: grafana
+  ingress:
+    - toPorts:
+        - ports:
+            - port: "3000"
+              protocol: TCP
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            app: vmsingle
+      toPorts:
+        - ports:
+            - port: "8428"
+              protocol: TCP

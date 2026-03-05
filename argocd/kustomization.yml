@@ -9,3 +9,10 @@ resources:
   - serviceaccount.yaml
   - role.yaml
   - rolebinding.yaml
+  - monitoring-namespace.yaml
+  - monitoring-victoria-metrics.yaml
+  - monitoring-node-exporter.yaml
+  - monitoring-grafana-password.yaml
+  - monitoring-grafana.yaml
+  - monitoring-grafana-dashboard.yaml
+  - monitoring-networkpolicy.yaml
