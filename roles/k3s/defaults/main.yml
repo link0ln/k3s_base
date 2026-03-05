@@ -6,3 +6,4 @@ k3s_api_retries: 30
 k3s_api_delay: 5
 helm_install_url: https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
 k3s_tls_san_extra: []
+k3s_https_port: 7443

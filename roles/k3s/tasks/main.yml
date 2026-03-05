@@ -15,6 +15,13 @@
     block: "{{ lookup('template', 'k3s-config.yaml.j2') }}"
   notify: Restart k3s
 
+# ── Cleanup manual workarounds ─────────────────────────────
+- name: Remove manual k3s.service.env if present
+  file:
+    path: /etc/systemd/system/k3s.service.env
+    state: absent
+  notify: Restart k3s
+
 # ── k3s installation ────────────────────────────────────────
 - name: Check if k3s is already installed
   stat:

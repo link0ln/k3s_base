@@ -1,5 +1,7 @@
 write-kubeconfig-mode: "0644"
 bind-address: "0.0.0.0"
+node-ip: "{{ ansible_host }}"
+https-listen-port: {{ k3s_https_port }}
 tls-san:
   - "{{ ansible_host }}"
 {% for san in k3s_tls_san_extra %}
