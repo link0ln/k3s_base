@@ -19,8 +19,7 @@ spec:
           args:
             - --path.procfs=/host/proc
             - --path.sysfs=/host/sys
-            - --path.rootfs=/host/root
-            - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|var/lib/docker/.+|var/lib/kubelet/.+)($|/)
+            - --no-collector.filesystem
           ports:
             - containerPort: 9100
               name: metrics
@@ -31,10 +30,6 @@ spec:
             - name: sys
               mountPath: /host/sys
               readOnly: true
-            - name: root
-              mountPath: /host/root
-              readOnly: true
-              mountPropagation: HostToContainer
           resources:
             requests:
               cpu: 50m
@@ -48,9 +43,6 @@ spec:
         - name: sys
           hostPath:
             path: /sys
-        - name: root
-          hostPath:
-            path: /
 ---
 apiVersion: v1
 kind: Service
