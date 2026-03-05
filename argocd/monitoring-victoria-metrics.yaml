@@ -10,6 +10,10 @@ data:
         scrape_interval: 15s
         static_configs:
           - targets: ['node-exporter:9100']
+      - job_name: dcgm-exporter
+        scrape_interval: 15s
+        static_configs:
+          - targets: ['dcgm-exporter:9400']
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim

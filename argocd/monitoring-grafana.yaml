@@ -28,6 +28,7 @@ data:
         disableDeletion: true
         options:
           path: /var/lib/grafana/dashboards
+          foldersFromFilesStructure: true
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -66,7 +67,9 @@ spec:
             - name: dashboard-providers
               mountPath: /etc/grafana/provisioning/dashboards
             - name: dashboards
-              mountPath: /var/lib/grafana/dashboards
+              mountPath: /var/lib/grafana/dashboards/node-exporter
+            - name: dashboards-gpu
+              mountPath: /var/lib/grafana/dashboards/gpu
           resources:
             requests:
               cpu: 100m
@@ -83,6 +86,9 @@ spec:
         - name: dashboards
           configMap:
             name: grafana-node-exporter-dashboard
+        - name: dashboards-gpu
+          configMap:
+            name: grafana-dcgm-dashboard
 ---
 apiVersion: v1
 kind: Service

@@ -15,4 +15,6 @@ resources:
   - monitoring-grafana-password.yaml
   - monitoring-grafana.yaml
   - monitoring-grafana-dashboard.yaml
+  - monitoring-dcgm-exporter.yaml
+  - monitoring-dcgm-dashboard.yaml
   - monitoring-networkpolicy.yaml
