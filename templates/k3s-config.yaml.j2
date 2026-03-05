@@ -1,4 +1,6 @@
 write-kubeconfig-mode: "0644"
+bind-address: "0.0.0.0"
+https-listen-port: 7443
 tls-san:
   - "{{ ansible_host }}"
 flannel-backend: "none"
