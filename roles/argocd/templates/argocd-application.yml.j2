@@ -16,3 +16,5 @@ spec:
     automated:
       prune: {{ argocd_app_prune | lower }}
       selfHeal: {{ argocd_app_self_heal | lower }}
+    syncOptions:
+      - ServerSideApply=true
