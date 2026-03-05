@@ -12,3 +12,5 @@ artifacts/untrusted-kubeconfig
 
 # Ansible retry files
 *.retry
+
+CLAUDE.md

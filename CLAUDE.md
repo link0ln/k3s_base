@@ -24,7 +24,7 @@ kubectl get nodes
 kubectl get pods -A -o wide
 
 # SSH into the target host
-ssh -i artifacts/id_ed25519 -o StrictHostKeyChecking=no root@192.168.196.67
+ssh -i artifacts/id_ed25519 -o StrictHostKeyChecking=no root@192.168.1.5
 ```
 
 ## Architecture
