@@ -81,6 +81,10 @@
     -n kube-system
     --timeout={{ cilium_wait_timeout }}
   changed_when: false
+  retries: 6
+  delay: 10
+  register: cilium_agent_wait
+  until: cilium_agent_wait.rc == 0
 
 # ── Post-Cilium: fix eBPF/TCX state after upgrade ──────────────────
 - name: Restart k3s with BPF cleanup after Cilium upgrade
