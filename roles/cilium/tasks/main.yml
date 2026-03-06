@@ -36,7 +36,7 @@
     echo "$VALS" | jq -e '
       .kubeProxyReplacement == {{ cilium_kube_proxy_replacement | lower }} and
       .k8sServiceHost == "{{ ansible_host }}" and
-      (.k8sServicePort == {{ k3s_https_port }} or .k8sServicePort == "{{ k3s_https_port }}") and
+      (.k8sServicePort == 6443 or .k8sServicePort == "6443") and
       .operator.replicas == {{ cilium_operator_replicas }} and
       .bpf.enableTCX == {{ cilium_bpf_enable_tcx | lower }} and
       .bpf.masquerade == {{ cilium_bpf_masquerade | lower }} and
@@ -58,7 +58,7 @@
     --namespace kube-system
     --set kubeProxyReplacement={{ cilium_kube_proxy_replacement }}
     --set k8sServiceHost={{ ansible_host }}
-    --set k8sServicePort={{ k3s_https_port }}
+    --set k8sServicePort=6443
     --set operator.replicas={{ cilium_operator_replicas }}
     --set bpf.enableTCX={{ cilium_bpf_enable_tcx }}
     --set bpf.masquerade={{ cilium_bpf_masquerade }}

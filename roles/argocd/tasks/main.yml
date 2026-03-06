@@ -199,7 +199,7 @@
       clusters:
         - cluster:
             certificate-authority-data: {{ untrusted_sa_ca }}
-            server: https://{{ hostvars[inventory_hostname]['ansible_host'] }}:{{ k3s_https_port | default(7443) }}
+            server: https://{{ hostvars[inventory_hostname]['ansible_host'] }}:6443
           name: k3s
       contexts:
         - context:
