@@ -1,6 +1,7 @@
 write-kubeconfig-mode: "0644"
 node-ip: "{{ ansible_host }}"
 https-listen-port: {{ k3s_https_port }}
+lb-server-port: {{ k3s_https_port | int + 1 }}
 tls-san:
   - "{{ ansible_host }}"
 {% for san in k3s_tls_san_extra %}
