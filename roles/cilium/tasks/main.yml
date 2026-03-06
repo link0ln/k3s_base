@@ -43,7 +43,8 @@
       .bpf.hostLegacyRouting == {{ cilium_bpf_host_legacy_routing | lower }} and
       .routingMode == "{{ cilium_routing_mode }}" and
       .autoDirectNodeRoutes == {{ cilium_auto_direct_node_routes | lower }} and
-      .socketLB.hostNamespaceOnly == {{ cilium_socket_lb_host_ns_only | lower }}
+      .socketLB.hostNamespaceOnly == {{ cilium_socket_lb_host_ns_only | lower }} and
+      .nodePort.range == "{{ cilium_nodeport_range }}"
     ' > /dev/null 2>&1 || { echo "Values differ from desired"; exit 1; }
     echo "Cilium is up to date (version ${DEPLOYED_VER})"
   register: cilium_up_to_date
@@ -53,7 +54,7 @@
     KUBECONFIG: /etc/rancher/k3s/k3s.yaml
 
 - name: Install or upgrade Cilium
-  command: >
+  shell: >
     /usr/local/bin/helm upgrade --install cilium cilium/cilium
     --namespace kube-system
     --set kubeProxyReplacement={{ cilium_kube_proxy_replacement }}
@@ -67,6 +68,7 @@
     --set ipv4NativeRoutingCIDR={{ cilium_native_routing_cidr }}
     --set autoDirectNodeRoutes={{ cilium_auto_direct_node_routes }}
     --set socketLB.hostNamespaceOnly={{ cilium_socket_lb_host_ns_only }}
+    --set-json 'nodePort.range="{{ cilium_nodeport_range }}"'
   register: cilium_install
   changed_when: "'has been upgraded' in cilium_install.stdout or 'has been installed' in cilium_install.stdout"
   when: cilium_up_to_date.rc != 0

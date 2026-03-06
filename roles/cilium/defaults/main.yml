@@ -9,6 +9,7 @@ cilium_routing_mode: native
 cilium_native_routing_cidr: 10.0.0.0/24
 cilium_auto_direct_node_routes: true
 cilium_socket_lb_host_ns_only: true
+cilium_nodeport_range: "30000,40000"
 cilium_wait_timeout: 300s
 cilium_helm_retries: 5
 cilium_helm_delay: 10
