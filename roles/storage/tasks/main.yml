@@ -7,23 +7,55 @@
     mode: '0755'
 
 - name: Check current local-path-config storage path
-  shell: /usr/local/bin/k3s kubectl get configmap local-path-config -n kube-system -o jsonpath='{.data.config\.json}'
-  register: local_path_current_config
-  changed_when: false
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_kubeconfig }}"
+    kind: ConfigMap
+    name: local-path-config
+    namespace: kube-system
+  register: local_path_cm
 
 - name: Patch local-path-config ConfigMap to use custom storage path
-  shell: |
-    /usr/local/bin/k3s kubectl get configmap local-path-config -n kube-system -o json \
-    | jq '.data["config.json"] = (.data["config.json"] | fromjson | .nodePathMap[0].paths = ["{{ storage_path }}"] | tojson)' \
-    | /usr/local/bin/k3s kubectl apply -f -
-  when: '"{{ storage_path }}" not in local_path_current_config.stdout'
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k8s_kubeconfig }}"
+    state: present
+    kind: ConfigMap
+    name: local-path-config
+    namespace: kube-system
+    definition:
+      data:
+        config.json: >-
+          {{ local_path_cm.resources[0].data['config.json']
+             | from_json
+             | combine({'nodePathMap': [{'node': 'DEFAULT_PATH_FOR_NON_LISTED_NODES', 'paths': [storage_path]}]}, recursive=true)
+             | to_json }}
   register: local_path_patch
+  when: storage_path not in (local_path_cm.resources[0].data['config.json'] | default(''))
 
 - name: Restart local-path-provisioner after config change
-  shell: /usr/local/bin/k3s kubectl rollout restart deployment local-path-provisioner -n kube-system
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k8s_kubeconfig }}"
+    kind: Deployment
+    name: local-path-provisioner
+    namespace: kube-system
+    definition:
+      spec:
+        template:
+          metadata:
+            annotations:
+              kubectl.kubernetes.io/restartedAt: "{{ ansible_date_time.iso8601 }}"
+    state: patched
   when: local_path_patch is changed
 
 - name: Wait for local-path-provisioner after config change
-  command: /usr/local/bin/k3s kubectl rollout status deployment local-path-provisioner -n kube-system --timeout={{ storage_provisioner_rollout_timeout }}
-  changed_when: false
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_kubeconfig }}"
+    kind: Deployment
+    name: local-path-provisioner
+    namespace: kube-system
+  register: lpp_deploy
+  retries: 24
+  delay: 5
+  until: >-
+    lpp_deploy.resources[0].status.readyReplicas | default(0) ==
+    lpp_deploy.resources[0].spec.replicas | default(1)
   when: local_path_patch is changed

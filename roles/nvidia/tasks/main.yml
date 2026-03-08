@@ -92,10 +92,14 @@
 # ── NVIDIA Container Toolkit ──
 - name: Install NVIDIA container toolkit
   block:
-    - name: Add NVIDIA container toolkit GPG key (modern approach)
-      shell: >
-        curl -fsSL {{ nvidia_container_toolkit_gpg_url }}
-        | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+    - name: Download NVIDIA container toolkit GPG key
+      get_url:
+        url: "{{ nvidia_container_toolkit_gpg_url }}"
+        dest: /tmp/nvidia-container-toolkit-keyring.gpg.armored
+        mode: '0644'
+
+    - name: Dearmor NVIDIA GPG key
+      command: gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg /tmp/nvidia-container-toolkit-keyring.gpg.armored
       args:
         creates: /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
 
@@ -149,43 +153,72 @@
   meta: flush_handlers
 
 - name: Wait for k3s API after NVIDIA runtime restart
-  command: /usr/local/bin/k3s kubectl get nodes
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_kubeconfig }}"
+    kind: Node
   register: k3s_ready_nvidia
   retries: "{{ nvidia_api_retries }}"
   delay: "{{ nvidia_api_delay }}"
-  until: k3s_ready_nvidia.rc == 0
-  changed_when: false
+  until: k3s_ready_nvidia.resources | length > 0
   when: nvidia_gpu_present | bool
 
 # After k3s restart, Cilium BPF needs time to initialize.
 # System pods that start before Cilium is ready get broken networking.
 - name: Wait for Cilium agent after NVIDIA runtime restart
-  command: >
-    /usr/local/bin/k3s kubectl wait
-    --for=condition=ready pod
-    -l app.kubernetes.io/name=cilium-agent
-    -n kube-system
-    --timeout={{ nvidia_cilium_wait_timeout }}
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_kubeconfig }}"
+    kind: Pod
+    namespace: kube-system
+    label_selectors:
+      - app.kubernetes.io/name=cilium-agent
+    wait: true
+    wait_condition:
+      type: Ready
+      status: "True"
+    wait_timeout: "{{ nvidia_cilium_wait_timeout | regex_replace('s$', '') | int }}"
   register: cilium_nvidia_wait
   retries: "{{ nvidia_cilium_wait_retries }}"
   delay: "{{ nvidia_cilium_wait_delay }}"
-  until: cilium_nvidia_wait.rc == 0
-  changed_when: false
+  until: cilium_nvidia_wait is not failed
   when: nvidia_gpu_present | bool
 
 - name: Restart system pods after NVIDIA k3s restart
-  shell: |
-    /usr/local/bin/k3s kubectl rollout restart deployment coredns -n kube-system
-    /usr/local/bin/k3s kubectl rollout restart deployment metrics-server -n kube-system
-    /usr/local/bin/k3s kubectl rollout restart deployment local-path-provisioner -n kube-system
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k8s_kubeconfig }}"
+    kind: Deployment
+    name: "{{ item }}"
+    namespace: kube-system
+    definition:
+      spec:
+        template:
+          metadata:
+            annotations:
+              kubectl.kubernetes.io/restartedAt: "{{ ansible_date_time.iso8601 }}"
+    state: patched
+  loop:
+    - coredns
+    - metrics-server
+    - local-path-provisioner
   when: nvidia_ctk_config is changed
 
 - name: Wait for system pod rollouts after NVIDIA k3s restart
-  shell: |
-    /usr/local/bin/k3s kubectl rollout status deployment coredns -n kube-system --timeout={{ nvidia_rollout_timeout }}
-    /usr/local/bin/k3s kubectl rollout status deployment metrics-server -n kube-system --timeout={{ nvidia_rollout_timeout }}
-    /usr/local/bin/k3s kubectl rollout status deployment local-path-provisioner -n kube-system --timeout={{ nvidia_rollout_timeout }}
-  changed_when: false
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_kubeconfig }}"
+    kind: Deployment
+    name: "{{ item }}"
+    namespace: kube-system
+  register: deploy_status
+  retries: 24
+  delay: 5
+  until: >-
+    deploy_status.resources[0].status.updatedReplicas | default(0) ==
+    deploy_status.resources[0].spec.replicas | default(1)
+    and deploy_status.resources[0].status.readyReplicas | default(0) ==
+    deploy_status.resources[0].spec.replicas | default(1)
+  loop:
+    - coredns
+    - metrics-server
+    - local-path-provisioner
   when: nvidia_ctk_config is changed
 
 # ── NVIDIA RuntimeClass for Kubernetes ──
@@ -205,91 +238,65 @@
 # In WSL there is no PCI bus, so NFD cannot detect GPU via lspci.
 # The device plugin DaemonSet requires one of these labels to schedule.
 - name: Label node with nvidia.com/gpu.present=true
-  command: >
-    /usr/local/bin/k3s kubectl label node {{ ansible_hostname | lower }}
-    nvidia.com/gpu.present=true --overwrite
-  register: nvidia_label
-  changed_when: "'labeled' in nvidia_label.stdout"
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k8s_kubeconfig }}"
+    kind: Node
+    name: "{{ ansible_hostname | lower }}"
+    state: patched
+    definition:
+      metadata:
+        labels:
+          nvidia.com/gpu.present: "true"
   when: nvidia_gpu_present | bool
 
 # ── NVIDIA Device Plugin via Helm ──
 - name: Add NVIDIA device plugin Helm repository
-  command: /usr/local/bin/helm repo add {{ nvidia_device_plugin_repo_name }} {{ nvidia_device_plugin_repo_url }}
-  register: nvdp_repo_add
-  changed_when: "'has been added' in nvdp_repo_add.stdout"
-  failed_when: nvdp_repo_add.rc != 0 and 'already exists' not in nvdp_repo_add.stderr
+  kubernetes.core.helm_repository:
+    name: "{{ nvidia_device_plugin_repo_name }}"
+    repo_url: "{{ nvidia_device_plugin_repo_url }}"
   retries: "{{ nvidia_device_plugin_helm_retries }}"
   delay: "{{ nvidia_device_plugin_helm_delay }}"
-  until: nvdp_repo_add.rc == 0 or 'already exists' in (nvdp_repo_add.stderr | default(''))
-  environment:
-    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
-  when: nvidia_gpu_present | bool
-
-- name: Update Helm repositories (after NVIDIA repo)
-  command: /usr/local/bin/helm repo update
-  changed_when: false
-  environment:
-    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
-  when: nvidia_gpu_present | bool
-
-- name: Check if NVIDIA device plugin is already up to date
-  shell: |
-    set -e
-    VALS=$(/usr/local/bin/helm get values nvidia-device-plugin -n kube-system -o json 2>/dev/null) || exit 1
-    DEPLOYED_VER=$(/usr/local/bin/helm list -n kube-system -f '^nvidia-device-plugin$' -o json | jq -r '.[0].chart' | sed 's/^nvidia-device-plugin-//')
-    LATEST_VER=$(/usr/local/bin/helm search repo {{ nvidia_device_plugin_repo_name }}/nvidia-device-plugin -o json | jq -r '.[0].version')
-    if [ "$DEPLOYED_VER" != "$LATEST_VER" ]; then
-      echo "Chart upgrade needed: ${DEPLOYED_VER} -> ${LATEST_VER}"
-      exit 1
-    fi
-    echo "$VALS" | jq -e '
-      .runtimeClassName == "{{ nvidia_runtime_class_name }}" and
-      .deviceListStrategy == "{{ nvidia_device_list_strategy }}"
-    ' > /dev/null 2>&1 || { echo "Values differ from desired"; exit 1; }
-    echo "NVIDIA device plugin is up to date (version ${DEPLOYED_VER})"
-  register: nvdp_up_to_date
-  changed_when: false
-  failed_when: false
-  environment:
-    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
   when: nvidia_gpu_present | bool
 
 - name: Install or upgrade NVIDIA device plugin
-  command: >
-    /usr/local/bin/helm upgrade --install nvidia-device-plugin {{ nvidia_device_plugin_repo_name }}/nvidia-device-plugin
-    --namespace kube-system
-    --set runtimeClassName={{ nvidia_runtime_class_name }}
-    --set deviceListStrategy={{ nvidia_device_list_strategy }}
-  register: nvdp_install
-  changed_when: "'has been upgraded' in nvdp_install.stdout or 'has been installed' in nvdp_install.stdout"
-  when:
-    - nvidia_gpu_present | bool
-    - nvdp_up_to_date.rc | default(1) != 0
-  environment:
-    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  kubernetes.core.helm:
+    name: nvidia-device-plugin
+    chart_ref: "{{ nvidia_device_plugin_repo_name }}/nvidia-device-plugin"
+    release_namespace: kube-system
+    kubeconfig: "{{ k8s_kubeconfig }}"
+    update_repo_cache: true
+    values:
+      runtimeClassName: "{{ nvidia_runtime_class_name }}"
+      deviceListStrategy: "{{ nvidia_device_list_strategy }}"
+  when: nvidia_gpu_present | bool
 
 - name: Wait for NVIDIA device plugin to be ready
-  command: >
-    /usr/local/bin/k3s kubectl wait --for=condition=ready pod
-    -l app.kubernetes.io/name=nvidia-device-plugin
-    -n kube-system --timeout={{ nvidia_device_plugin_wait_timeout }}
-  register: nvdp_wait
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_kubeconfig }}"
+    kind: Pod
+    namespace: kube-system
+    label_selectors:
+      - app.kubernetes.io/name=nvidia-device-plugin
+    wait: true
+    wait_condition:
+      type: Ready
+      status: "True"
+    wait_timeout: "{{ nvidia_device_plugin_wait_timeout | regex_replace('s$', '') | int }}"
   retries: 3
   delay: 10
-  until: nvdp_wait.rc == 0
-  changed_when: false
   when: nvidia_gpu_present | bool
 
 # ── GPU verification ──
 - name: Verify GPU is visible in Kubernetes
-  command: /usr/local/bin/k3s kubectl get nodes -o jsonpath='{.items[*].status.allocatable.nvidia\.com/gpu}'
-  register: gpu_allocatable
-  changed_when: false
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_kubeconfig }}"
+    kind: Node
+  register: gpu_nodes
   when: nvidia_gpu_present | bool
 
 - name: GPU support status
   debug:
     msg: >-
-      {{ 'NVIDIA GPU detected. Allocatable GPUs: ' + (gpu_allocatable.stdout | default('checking...'))
+      {{ 'NVIDIA GPU detected. Allocatable GPUs: ' + (gpu_nodes.resources[0].status.allocatable['nvidia.com/gpu'] | default('checking...'))
          if (nvidia_gpu_present | bool)
          else 'No NVIDIA GPU detected — GPU support tasks skipped' }}

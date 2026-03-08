@@ -17,3 +17,4 @@ common_packages:
   - ca-certificates
   - gnupg
   - pciutils
+  - python3-pip

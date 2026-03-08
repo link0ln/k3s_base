@@ -49,76 +49,77 @@
 
 # ── Namespace ─────────────────────────────────────────────────────
 - name: Create ArgoCD namespace
-  command: /usr/local/bin/k3s kubectl create namespace {{ argocd_namespace }}
-  register: argocd_ns
-  changed_when: argocd_ns.rc == 0
-  failed_when: argocd_ns.rc != 0 and 'already exists' not in argocd_ns.stderr
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k8s_kubeconfig }}"
+    kind: Namespace
+    name: "{{ argocd_namespace }}"
+    state: present
 
 # ── Helm install ──────────────────────────────────────────────────
 - name: Add ArgoCD Helm repository
-  command: /usr/local/bin/helm repo add {{ argocd_helm_repo_name }} {{ argocd_helm_repo_url }}
-  register: argocd_repo_add
-  changed_when: "'has been added' in argocd_repo_add.stdout"
-  failed_when: argocd_repo_add.rc != 0 and 'already exists' not in argocd_repo_add.stderr
+  kubernetes.core.helm_repository:
+    name: "{{ argocd_helm_repo_name }}"
+    repo_url: "{{ argocd_helm_repo_url }}"
   retries: 5
   delay: 10
-  until: argocd_repo_add.rc == 0 or 'already exists' in (argocd_repo_add.stderr | default(''))
-  environment:
-    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
-
-- name: Update Helm repositories
-  command: /usr/local/bin/helm repo update
-  changed_when: false
-  environment:
-    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
 
 - name: Install or upgrade ArgoCD
-  command: >
-    /usr/local/bin/helm upgrade --install {{ argocd_release_name }} {{ argocd_helm_repo_name }}/{{ argocd_chart_name }}
-    --namespace {{ argocd_namespace }}
-    --set-string configs.secret.argocdServerAdminPassword={{ argocd_bcrypt_hash }}
-    --set redis.image.repository=redis
-    --set redis.image.tag=7-alpine
-    --wait
-    --timeout {{ argocd_helm_timeout }}
+  kubernetes.core.helm:
+    name: "{{ argocd_release_name }}"
+    chart_ref: "{{ argocd_helm_repo_name }}/{{ argocd_chart_name }}"
+    release_namespace: "{{ argocd_namespace }}"
+    kubeconfig: "{{ k8s_kubeconfig }}"
+    update_repo_cache: true
+    wait: true
+    timeout: "{{ argocd_helm_timeout }}"
+    values:
+      configs:
+        secret:
+          argocdServerAdminPassword: "{{ argocd_bcrypt_hash }}"
+      redis:
+        image:
+          repository: redis
+          tag: 7-alpine
   register: argocd_install
-  changed_when: "'has been upgraded' in argocd_install.stdout or 'has been installed' in argocd_install.stdout"
-  environment:
-    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
 
 # ── Wait for readiness ────────────────────────────────────────────
-- name: Wait for argocd-server deployment rollout
-  command: >
-    /usr/local/bin/k3s kubectl rollout status
-    deployment/argocd-server
-    -n {{ argocd_namespace }}
-    --timeout={{ argocd_wait_timeout }}
-  changed_when: false
+- name: Wait for argocd-server deployment
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_kubeconfig }}"
+    kind: Deployment
+    name: argocd-server
+    namespace: "{{ argocd_namespace }}"
+  register: argocd_deploy
+  retries: 30
+  delay: 10
+  until: >-
+    argocd_deploy.resources[0].status.readyReplicas | default(0) ==
+    argocd_deploy.resources[0].spec.replicas | default(1)
 
 - name: Wait for ArgoCD pods to be ready
-  shell: >
-    /usr/local/bin/k3s kubectl get pods -n {{ argocd_namespace }}
-    -l app.kubernetes.io/instance={{ argocd_release_name }}
-    --field-selector=status.phase=Running
-    -o jsonpath='{.items[*].metadata.name}' |
-    tr ' ' '\n' | grep -v '^$' |
-    xargs -r /usr/local/bin/k3s kubectl wait
-    --for=condition=ready pod
-    -n {{ argocd_namespace }}
-    --timeout={{ argocd_wait_timeout }}
-  changed_when: false
-  register: argocd_wait
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_kubeconfig }}"
+    kind: Pod
+    namespace: "{{ argocd_namespace }}"
+    label_selectors:
+      - "app.kubernetes.io/instance={{ argocd_release_name }}"
+    field_selectors:
+      - status.phase=Running
+    wait: true
+    wait_condition:
+      type: Ready
+      status: "True"
+    wait_timeout: "{{ argocd_wait_timeout | regex_replace('s$', '') | int }}"
   retries: 3
   delay: 10
-  until: argocd_wait.rc == 0
 
 # ── Deploy ArgoCD Application ─────────────────────────────────────
 - name: Deploy ArgoCD Application for k3s-base
-  command: /usr/local/bin/k3s kubectl apply -f -
-  args:
-    stdin: "{{ lookup('template', 'argocd-application.yml.j2') }}"
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k8s_kubeconfig }}"
+    state: present
+    definition: "{{ lookup('template', 'argocd-application.yml.j2') | from_yaml }}"
   register: argocd_app_apply
-  changed_when: "'created' in argocd_app_apply.stdout or 'configured' in argocd_app_apply.stdout"
 
 - name: ArgoCD Application status
   debug:
@@ -126,33 +127,34 @@
 
 # ── Generate kubeconfig for untrusted SA ──────────────────────────
 - name: Wait for ArgoCD to sync application
-  shell: |
-    for i in $(seq 1 30); do
-      STATUS=$(/usr/local/bin/k3s kubectl get application {{ argocd_app_name }} -n {{ argocd_namespace }} -o jsonpath='{.status.sync.status}' 2>/dev/null)
-      if [ "$STATUS" = "Synced" ]; then
-        echo "Synced"
-        exit 0
-      fi
-      sleep 5
-    done
-    echo "Timeout waiting for sync, current status: $STATUS"
-    exit 1
-  args:
-    executable: /bin/bash
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_kubeconfig }}"
+    api_version: argoproj.io/v1alpha1
+    kind: Application
+    name: "{{ argocd_app_name }}"
+    namespace: "{{ argocd_namespace }}"
+  register: argocd_sync
+  retries: 30
+  delay: 5
+  until: (argocd_sync.resources[0].status.sync.status | default('')) == 'Synced'
   changed_when: false
 
 - name: Wait for untrusted-user ServiceAccount
-  command: /usr/local/bin/k3s kubectl get serviceaccount untrusted-user -n untrusted
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_kubeconfig }}"
+    kind: ServiceAccount
+    name: untrusted-user
+    namespace: untrusted
   register: untrusted_sa_check
   retries: 12
   delay: 10
-  until: untrusted_sa_check.rc == 0
-  changed_when: false
+  until: untrusted_sa_check.resources | length > 0
 
 - name: Create SA token secret for untrusted-user
-  command: /usr/local/bin/k3s kubectl apply -f -
-  args:
-    stdin: |
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k8s_kubeconfig }}"
+    state: present
+    definition:
       apiVersion: v1
       kind: Secret
       metadata:
@@ -161,34 +163,23 @@
         annotations:
           kubernetes.io/service-account.name: untrusted-user
       type: kubernetes.io/service-account-token
-  register: untrusted_secret_apply
-  changed_when: "'created' in untrusted_secret_apply.stdout or 'configured' in untrusted_secret_apply.stdout"
 
 - name: Wait for token to be populated in secret
-  shell: /usr/local/bin/k3s kubectl get secret untrusted-user-token -n untrusted -o jsonpath='{.data.token}'
-  register: untrusted_token_check
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_kubeconfig }}"
+    kind: Secret
+    name: untrusted-user-token
+    namespace: untrusted
+  register: untrusted_secret
   retries: 12
   delay: 5
-  until: untrusted_token_check.stdout | length > 0
+  until: (untrusted_secret.resources[0].data.token | default('')) | length > 0
   changed_when: false
-
-- name: Extract SA token and CA from secret
-  shell: |
-    TOKEN=$(/usr/local/bin/k3s kubectl get secret untrusted-user-token -n untrusted -o jsonpath='{.data.token}' | base64 -d)
-    CA=$(/usr/local/bin/k3s kubectl get secret untrusted-user-token -n untrusted -o jsonpath='{.data.ca\.crt}')
-    echo "${TOKEN}"
-    echo "---CA---"
-    echo "${CA}"
-  args:
-    executable: /bin/bash
-  register: untrusted_sa_data
-  changed_when: false
-  no_log: true
 
 - name: Set SA token and CA facts
   set_fact:
-    untrusted_sa_token: "{{ untrusted_sa_data.stdout.split('---CA---')[0] | trim }}"
-    untrusted_sa_ca: "{{ untrusted_sa_data.stdout.split('---CA---')[1] | trim }}"
+    untrusted_sa_token: "{{ untrusted_secret.resources[0].data.token | b64decode }}"
+    untrusted_sa_ca: "{{ untrusted_secret.resources[0].data['ca.crt'] }}"
   no_log: true
 
 - name: Generate kubeconfig for untrusted-user SA
@@ -223,10 +214,12 @@
     msg: "Kubeconfig for untrusted-user SA saved to: artifacts/untrusted-kubeconfig"
 
 # ── Status output ─────────────────────────────────────────────────
-- name: Display ArgoCD pod status
-  shell: /usr/local/bin/k3s kubectl get pods -n {{ argocd_namespace }} -o wide
+- name: Get ArgoCD pod status
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_kubeconfig }}"
+    kind: Pod
+    namespace: "{{ argocd_namespace }}"
   register: argocd_pods
-  changed_when: false
 
 - name: ArgoCD deployment summary
   debug:
@@ -236,4 +229,4 @@
       - "Access UI: kubectl port-forward svc/argocd-server -n {{ argocd_namespace }} 8080:443"
       - "Login: admin / <contents of {{ argocd_password_file }}>"
       - ""
-      - "{{ argocd_pods.stdout_lines }}"
+      - "Pods: {{ argocd_pods.resources | map(attribute='metadata.name') | list }}"

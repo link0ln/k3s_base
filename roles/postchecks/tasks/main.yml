@@ -25,39 +25,63 @@
 
 # ── Node readiness ────────────────────────────────────────────
 - name: "Post-check: wait for all nodes to be Ready"
-  command: >
-    /usr/local/bin/k3s kubectl wait
-    --for=condition=Ready node --all --timeout={{ postchecks_node_timeout }}
-  changed_when: false
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_kubeconfig }}"
+    kind: Node
+  register: node_status
+  retries: 24
+  delay: 5
+  until: >-
+    node_status.resources | map(attribute='status.conditions')
+    | map('selectattr', 'type', 'eq', 'Ready')
+    | map('first') | map(attribute='status') | list
+    | reject('eq', 'True') | list | length == 0
 
 # ── Deployment rollouts ───────────────────────────────────────
-- name: "Post-check: wait for coredns deployment"
-  command: /usr/local/bin/k3s kubectl rollout status deployment/coredns -n kube-system --timeout={{ postchecks_rollout_timeout }}
-  changed_when: false
-
-- name: "Post-check: wait for metrics-server deployment"
-  command: /usr/local/bin/k3s kubectl rollout status deployment/metrics-server -n kube-system --timeout={{ postchecks_rollout_timeout }}
-  changed_when: false
-
-- name: "Post-check: wait for local-path-provisioner deployment"
-  command: /usr/local/bin/k3s kubectl rollout status deployment/local-path-provisioner -n kube-system --timeout={{ postchecks_rollout_timeout }}
-  changed_when: false
-
-- name: "Post-check: wait for cilium-operator deployment"
-  command: /usr/local/bin/k3s kubectl rollout status deployment/cilium-operator -n kube-system --timeout={{ postchecks_rollout_timeout }}
-  changed_when: false
+- name: "Post-check: wait for system deployments"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_kubeconfig }}"
+    kind: Deployment
+    name: "{{ item }}"
+    namespace: kube-system
+  register: deploy_check
+  retries: 24
+  delay: 5
+  until: >-
+    deploy_check.resources[0].status.readyReplicas | default(0) ==
+    deploy_check.resources[0].spec.replicas | default(1)
+  loop:
+    - coredns
+    - metrics-server
+    - local-path-provisioner
+    - cilium-operator
 
 # ── DaemonSet rollouts ────────────────────────────────────────
 - name: "Post-check: wait for cilium DaemonSet"
-  command: /usr/local/bin/k3s kubectl rollout status daemonset/cilium -n kube-system --timeout={{ postchecks_rollout_timeout }}
-  changed_when: false
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_kubeconfig }}"
+    kind: DaemonSet
+    name: cilium
+    namespace: kube-system
+  register: cilium_ds
+  retries: 24
+  delay: 5
+  until: >-
+    cilium_ds.resources[0].status.numberReady | default(0) ==
+    cilium_ds.resources[0].status.desiredNumberScheduled | default(1)
 
 - name: "Post-check: wait for nvidia-device-plugin pods"
-  command: >
-    /usr/local/bin/k3s kubectl wait --for=condition=ready pod
-    -l app.kubernetes.io/name=nvidia-device-plugin
-    -n kube-system --timeout={{ postchecks_rollout_timeout }}
-  changed_when: false
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_kubeconfig }}"
+    kind: Pod
+    namespace: kube-system
+    label_selectors:
+      - app.kubernetes.io/name=nvidia-device-plugin
+    wait: true
+    wait_condition:
+      type: Ready
+      status: "True"
+    wait_timeout: "{{ postchecks_rollout_timeout | regex_replace('s$', '') | int }}"
   when: nvidia_gpu_present | default(false) | bool
 
 # ── Comprehensive pod readiness verification ──────────────────
