@@ -10,13 +10,11 @@ spec:
   containers:
     - name: socat
       image: alpine/socat:latest
-      securityContext:
-        privileged: true
       args:
-        - TCP-LISTEN:30022,fork,reuseaddr
+        - TCP-LISTEN:29022,fork,reuseaddr
         - TCP:rsync-loader.untrusted.svc.cluster.local:22
       ports:
-        - containerPort: 30022
+        - containerPort: 29022
           protocol: TCP
       resources:
         requests:
