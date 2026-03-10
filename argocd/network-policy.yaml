@@ -13,9 +13,6 @@ spec:
     - fromEndpoints:
         - matchLabels:
             io.kubernetes.pod.namespace: port-proxy
-  ingressDeny:
-    - fromEntities:
-        - all
   egress:
     - toEndpoints:
         - matchLabels:
