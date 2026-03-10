@@ -1,0 +1,26 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: rsync-proxy
+  namespace: port-proxy
+  labels:
+    app: rsync-proxy
+spec:
+  containers:
+    - name: socat
+      image: alpine/socat:latest
+      args:
+        - TCP-LISTEN:22,fork,reuseaddr
+        - TCP:rsync-loader.untrusted.svc.cluster.local:22
+      ports:
+        - containerPort: 22
+          hostPort: 30022
+          protocol: TCP
+      resources:
+        requests:
+          cpu: 10m
+          memory: 16Mi
+        limits:
+          cpu: 100m
+          memory: 32Mi
+  restartPolicy: Always

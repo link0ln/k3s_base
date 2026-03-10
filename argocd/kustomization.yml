@@ -19,3 +19,5 @@ resources:
   - monitoring-dcgm-exporter.yaml
   - monitoring-dcgm-dashboard.yaml
   - monitoring-networkpolicy.yaml
+  - port-proxy-namespace.yaml
+  - port-proxy-rsync.yaml
