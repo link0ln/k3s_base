@@ -7,6 +7,7 @@ metadata:
     app: rsync-proxy
 spec:
   hostNetwork: true
+  dnsPolicy: ClusterFirstWithHostNet
   containers:
     - name: socat
       image: alpine/socat:latest
