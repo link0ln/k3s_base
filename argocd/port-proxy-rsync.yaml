@@ -6,15 +6,15 @@ metadata:
   labels:
     app: rsync-proxy
 spec:
+  hostNetwork: true
   containers:
     - name: socat
       image: alpine/socat:latest
       args:
-        - TCP-LISTEN:22,fork,reuseaddr
+        - TCP-LISTEN:30022,fork,reuseaddr
         - TCP:rsync-loader.untrusted.svc.cluster.local:22
       ports:
-        - containerPort: 22
-          hostPort: 30022
+        - containerPort: 30022
           protocol: TCP
       resources:
         requests:
