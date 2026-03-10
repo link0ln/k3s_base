@@ -13,7 +13,7 @@ spec:
       image: alpine/socat:latest
       args:
         - TCP-LISTEN:29022,fork,reuseaddr
-        - TCP:rsync-loader.untrusted.svc.cluster.local:22
+        - TCP:rsync-loader.untrusted.svc.cluster.local:8873
       ports:
         - containerPort: 29022
           protocol: TCP
