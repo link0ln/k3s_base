@@ -8,6 +8,11 @@ spec:
   ingress:
     - fromCIDRSet:
         - cidr: 192.168.1.0/24
+    - fromEntities:
+        - host
+    - fromEndpoints:
+        - matchLabels:
+            io.kubernetes.pod.namespace: port-proxy
   ingressDeny:
     - fromEntities:
         - all
