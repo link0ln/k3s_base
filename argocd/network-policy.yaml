@@ -5,6 +5,9 @@ metadata:
   namespace: untrusted
 spec:
   endpointSelector: {}
+  ingress:
+    - fromCIDRSet:
+        - cidr: 192.168.1.0/24
   ingressDeny:
     - fromEntities:
         - all
