@@ -13,7 +13,7 @@ spec:
     limits.nvidia.com/gpu: "1"
     pods: "10"
     services: "5"
-    services.nodeports: "0"
+    services.nodeports: "3"
     services.loadbalancers: "0"
     secrets: "10"
     configmaps: "10"
