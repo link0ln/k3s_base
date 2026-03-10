@@ -9,6 +9,7 @@ resources:
   - serviceaccount.yaml
   - role.yaml
   - rolebinding.yaml
+  - clusterrole-storage.yaml
   - monitoring-namespace.yaml
   - monitoring-victoria-metrics.yaml
   - monitoring-node-exporter.yaml
