@@ -14,11 +14,11 @@ spec:
         memory: 64Mi
       max:
         cpu: "20"
-        memory: 80Gi
+        memory: 60Gi
       min:
         cpu: 10m
         memory: 16Mi
     - type: Pod
       max:
-        cpu: "2"
-        memory: 2Gi
+        cpu: "20"
+        memory: 60Gi
