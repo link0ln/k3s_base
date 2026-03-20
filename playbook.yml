@@ -47,7 +47,6 @@
     - k3s
     - cilium
     - storage
-    - smb-csi
     - nvidia
     - argocd
     - postchecks

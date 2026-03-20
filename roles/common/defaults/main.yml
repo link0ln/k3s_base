@@ -18,3 +18,5 @@ common_packages:
   - gnupg
   - pciutils
   - python3-pip
+  - nfs-common
+  - cifs-utils
