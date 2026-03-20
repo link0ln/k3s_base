@@ -3,7 +3,7 @@ kind: Kustomization
 resources:
   - namespace.yaml
   - network-policy.yaml
-- appproject.yaml
+  - appproject.yaml
   - serviceaccount.yaml
   - role.yaml
   - rolebinding.yaml
