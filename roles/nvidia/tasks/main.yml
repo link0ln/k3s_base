@@ -268,6 +268,16 @@
     values:
       runtimeClassName: "{{ nvidia_runtime_class_name }}"
       deviceListStrategy: "{{ nvidia_device_list_strategy }}"
+      config:
+        default: "time-slicing"
+        map:
+          time-slicing: |-
+            version: v1
+            sharing:
+              timeSlicing:
+                resources:
+                  - name: nvidia.com/gpu
+                    replicas: {{ nvidia_time_slicing_replicas }}
   when: nvidia_gpu_present | bool
 
 - name: Wait for NVIDIA device plugin to be ready

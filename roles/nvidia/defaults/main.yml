@@ -6,6 +6,7 @@ nvidia_device_plugin_repo_name: nvdp
 nvidia_device_plugin_repo_url: https://nvidia.github.io/k8s-device-plugin
 nvidia_runtime_class_name: nvidia
 nvidia_device_list_strategy: volume-mounts
+nvidia_time_slicing_replicas: 4
 nvidia_device_plugin_helm_retries: 3
 nvidia_device_plugin_helm_delay: 10
 nvidia_api_retries: 30
