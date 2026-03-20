@@ -1,0 +1,9 @@
+---
+smb_csi_helm_repo_name: csi-driver-smb
+smb_csi_helm_repo_url: https://raw.githubusercontent.com/kubernetes-csi/csi-driver-smb/master/charts
+smb_csi_release_name: csi-driver-smb
+smb_csi_namespace: kube-system
+smb_csi_helm_retries: 3
+smb_csi_helm_delay: 10
+smb_csi_wait_retries: 30
+smb_csi_wait_delay: 5
